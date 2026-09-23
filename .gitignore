@@ -3,6 +3,9 @@
 /bin/
 /linux/
 
+# Documentation / Meta files
+/docs/
+
 # Generated kernel/initramfs artifacts
 /initramfs.cpio.gz
 *.cpio.gz
@@ -12,3 +15,4 @@
 .DS_Store
 *.swp
 *~
+
