@@ -1,0 +1,23 @@
+[package]
+name = "trillby"
+version = "0.1.0"
+edition = "2021"
+authors = ["Trillby Team"]
+description = "Handheld Production Floor Scanner Client"
+
+[dependencies]
+embedded-graphics = "0.8"
+embedded-graphics-framebuf = "0.3"
+heapless = "0.8"
+libc = "0.2"
+
+[[bin]]
+name = "trillby"
+path = "src/main.rs"
+
+[features]
+default = []
+qemu-sim = []
+
+
+

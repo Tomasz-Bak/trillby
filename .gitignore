@@ -1,0 +1,4 @@
+/target/
+/bin/
+/initramfs.cpio.gz
+/linux/
