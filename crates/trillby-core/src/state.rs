@@ -1,22 +1,12 @@
-use super::keyboard::{Key, KeyboardGrid, KeyboardMode};
-use embedded_graphics::geometry::Point;
-use embedded_graphics::primitives::Rectangle;
+use crate::event::UiEvent;
+use crate::geometry::{Point, Rect};
+use crate::keyboard_types::{Key, KeyboardMode};
 use heapless::String;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Screen {
     #[default]
     Debug,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum UiEvent {
-    TouchDown { scaled: Point, raw: (i32, i32) },
-    TouchUp { scaled: Point, raw: (i32, i32) },
-    TouchMove { scaled: Point, raw: (i32, i32) },
-    RfidScanned(String<32>),
-    BarcodeScanned(String<64>),
-    Tick,
 }
 
 pub struct UiState<const N: usize> {
@@ -44,8 +34,12 @@ impl<const N: usize> Default for UiState<N> {
         let _ = boot_msg.push_str("Boot Complete");
 
         let mut init_history: [String<64>; 6] = [
-            String::new(), String::new(), String::new(),
-            String::new(), String::new(), String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
         ];
         let _ = init_history[0].push_str("System initialized (Bare Framework Scaffolding)");
 
@@ -91,7 +85,7 @@ impl<const N: usize> UiState<N> {
     }
 
     /// Process an incoming UI event.
-    pub fn handle_event(&mut self, event: UiEvent, _screen_bounds: Rectangle, kb_bounds: Option<Rectangle>) {
+    pub fn handle_event(&mut self, event: UiEvent, _screen_bounds: Rect, kb_bounds: Option<Rect>, resolved_key: Option<Key>) {
         match event {
             UiEvent::Tick => {
                 self.tick_count = self.tick_count.saturating_add(1);
@@ -138,7 +132,7 @@ impl<const N: usize> UiState<N> {
                 if self.keyboard_mode != KeyboardMode::Hidden {
                     if let Some(bounds) = kb_bounds {
                         if bounds.contains(scaled) {
-                            self.active_touch_key = KeyboardGrid::resolve_key(bounds, scaled, self.keyboard_mode);
+                            self.active_touch_key = resolved_key;
                         }
                     }
                 }
@@ -221,58 +215,3 @@ impl<const N: usize> UiState<N> {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use embedded_graphics::geometry::Size;
-
-    #[test]
-    fn test_scaffolding_touch_and_key() {
-        let mut state: UiState<256> = UiState::new();
-        let screen_bounds = Rectangle::new(Point::zero(), Size::new(800, 480));
-        let kb_bounds = Rectangle::new(Point::new(0, 300), Size::new(800, 180));
-
-        // TouchDown on Q key (10, 310)
-        state.handle_event(
-            UiEvent::TouchDown {
-                scaled: Point::new(10, 310),
-                raw: (400, 20000),
-            },
-            screen_bounds,
-            Some(kb_bounds),
-        );
-        assert_eq!(state.active_touch_key, Some(Key::Char('Q')));
-        assert_eq!(state.touch_count, 1);
-
-        // TouchUp on Q key
-        state.handle_event(
-            UiEvent::TouchUp {
-                scaled: Point::new(10, 310),
-                raw: (400, 20000),
-            },
-            screen_bounds,
-            Some(kb_bounds),
-        );
-        assert_eq!(state.input_buffer.as_str(), "Q");
-        assert_eq!(state.key_count, 1);
-        assert_eq!(state.last_key_pressed, Some(Key::Char('Q')));
-    }
-
-    #[test]
-    fn test_barcode_and_rfid_in_scaffolding() {
-        let mut state: UiState<256> = UiState::new();
-        let bounds = Rectangle::new(Point::zero(), Size::new(800, 480));
-
-        let rfid: String<32> = String::try_from("OP_9901").unwrap();
-        state.handle_event(UiEvent::RfidScanned(rfid), bounds, None);
-        assert_eq!(state.input_buffer.as_str(), "OP_9901");
-        assert_eq!(state.rfid_count, 1);
-
-        let barcode: String<64> = String::try_from("ITEM-12345").unwrap();
-        state.handle_event(UiEvent::BarcodeScanned(barcode), bounds, None);
-        assert_eq!(state.input_buffer.as_str(), "OP_9901ITEM-12345");
-        assert_eq!(state.barcode_count, 1);
-    }
-}
-

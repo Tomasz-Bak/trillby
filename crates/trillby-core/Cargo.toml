@@ -1,0 +1,9 @@
+[package]
+name = "trillby-core"
+version = "0.1.0"
+edition = "2021"
+authors = ["Trillby Team"]
+description = "Core business logic and event types for Trillby handheld scanner"
+
+[dependencies]
+heapless = "0.8"

@@ -25,7 +25,7 @@ echo "==> Building static AArch64 Trillby binary..."
 CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-unknown-linux-gnu-gcc \
 RUSTFLAGS="-C target-feature=+crt-static" \
 RUSTC_BOOTSTRAP=1 \
-cargo build -Z build-std --target aarch64-unknown-linux-gnu --features qemu-sim
+cargo build -Z build-std --target aarch64-unknown-linux-gnu --package trillby --features qemu-sim
 
 STAGING_DIR="$(pwd)/target/initramfs_staging"
 echo "==> Packaging initramfs with static Trillby binary as /init..."
@@ -59,5 +59,3 @@ exec qemu-system-aarch64 \
     -device virtio-tablet-pci \
     -display "$DISPLAY_OPT" \
     -serial stdio
-
-

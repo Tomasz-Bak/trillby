@@ -1,0 +1,12 @@
+[package]
+name = "trillby-ui"
+version = "0.1.0"
+edition = "2021"
+authors = ["Trillby Team"]
+description = "embedded-graphics UI renderer and theme engine for Trillby"
+
+[dependencies]
+trillby-core = { path = "../trillby-core" }
+embedded-graphics = "0.8"
+embedded-graphics-framebuf = "0.3"
+heapless = "0.8"

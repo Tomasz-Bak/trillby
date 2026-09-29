@@ -16,3 +16,6 @@
 *.swp
 *~
 
+# Image dumps
+*.ppm
+*.png

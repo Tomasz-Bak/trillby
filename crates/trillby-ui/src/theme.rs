@@ -16,7 +16,7 @@ pub trait ColorScheme {
     fn success(&self) -> Self::Color;
 }
 
-/// High-contrast production floor theme using 16-bit RGB565 colors.
+/// Slate Blue Web Theme using calibrated 16-bit RGB565 colors (Slate 800 Navy Canvas & Indigo palette).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DarkFloorTheme;
 
@@ -25,26 +25,26 @@ impl ColorScheme for DarkFloorTheme {
 
     #[inline]
     fn background(&self) -> Self::Color {
-        // Dark slate background (15, 23, 42)
-        Rgb565::new(1, 5, 5)
-    }
-
-    #[inline]
-    fn surface(&self) -> Self::Color {
-        // Dark surface card (30, 41, 59)
+        // Distinct Navy/Slate Blue Canvas (#1E293B - Slate 800, NOT black)
         Rgb565::new(3, 10, 7)
     }
 
     #[inline]
-    fn surface_active(&self) -> Self::Color {
-        // Active key / card state (51, 65, 85)
+    fn surface(&self) -> Self::Color {
+        // Elevated Slate Surface Card (#334155 - Slate 700)
         Rgb565::new(6, 16, 10)
     }
 
     #[inline]
+    fn surface_active(&self) -> Self::Color {
+        // Active Button / Pressed Card (#475569 - Slate 600)
+        Rgb565::new(8, 21, 13)
+    }
+
+    #[inline]
     fn primary(&self) -> Self::Color {
-        // Vivid cyan/emerald primary (16, 185, 129)
-        Rgb565::new(2, 46, 16)
+        // Vibrant Indigo Primary Accent (#6366F1)
+        Rgb565::new(12, 25, 29)
     }
 
     #[inline]
@@ -54,31 +54,31 @@ impl ColorScheme for DarkFloorTheme {
 
     #[inline]
     fn text(&self) -> Self::Color {
-        // Crisp white text
+        // Crisp High-Contrast White (#FFFFFF)
         Rgb565::WHITE
     }
 
     #[inline]
     fn text_muted(&self) -> Self::Color {
-        // Light gray (148, 163, 184)
-        Rgb565::new(18, 40, 23)
+        // Soft Slate Text (#CBD5E1 - Slate 300)
+        Rgb565::new(24, 52, 27)
     }
 
     #[inline]
     fn border(&self) -> Self::Color {
-        // Subdued border (71, 85, 105)
-        Rgb565::new(8, 21, 13)
+        // Visible Slate Border (#64748B - Slate 500)
+        Rgb565::new(12, 28, 17)
     }
 
     #[inline]
     fn warning(&self) -> Self::Color {
-        // Warm amber (245, 158, 11)
+        // Warm Amber (#F59E0B)
         Rgb565::new(30, 39, 1)
     }
 
     #[inline]
     fn success(&self) -> Self::Color {
-        // Green success (34, 197, 94)
-        Rgb565::new(4, 49, 11)
+        // Emerald Success (#10B981)
+        Rgb565::new(2, 46, 16)
     }
 }

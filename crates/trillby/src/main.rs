@@ -31,7 +31,12 @@ use embedded_graphics::{
     primitives::Rectangle,
 };
 use embedded_graphics_framebuf::FrameBuf;
-use trillby::ui::{LayoutZones, UiEvent, UiRenderer, UiState};
+use trillby_core::{
+    Point as CorePoint, UiEvent, UiState,
+};
+use trillby_ui::{
+    eg_rect_to_core, KeyboardGrid, LayoutZones, UiRenderer,
+};
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone, Default)]
@@ -155,7 +160,6 @@ impl FramebufferWriter {
         let fd = unsafe { libc::open(b"/dev/fb0\0".as_ptr() as *const _, libc::O_RDWR) };
         if fd >= 0 {
             let mut var_info: FbVarScreeninfo = unsafe { core::mem::zeroed() };
-            // #define FBIOGET_VSCREENINFO 0x4600
             let res = unsafe {
                 libc::ioctl(fd, 0x4600, &mut var_info as *mut _ as *mut libc::c_void)
             };
@@ -232,9 +236,12 @@ fn run_app() {
     raw_print("====================================================\n");
     raw_print(" Trillby Handheld Scanner — #![no_std] UI Engine\n");
     raw_print(" Mode: Zero-Allocation POSIX Poll Loop (800x480)\n");
+    raw_print(" Architecture: Multi-Crate Workspace (core/ui/bin)\n");
     raw_print("====================================================\n");
 
     let screen_bounds = Rectangle::new(Point::zero(), Size::new(800, 480));
+    let core_bounds = eg_rect_to_core(screen_bounds);
+
     let mut state: UiState<256> = UiState::new();
     let renderer = UiRenderer::new(screen_bounds);
     let mut fb_writer = FramebufferWriter::new();
@@ -291,17 +298,17 @@ fn run_app() {
 
     // Single-threaded zero-allocation POSIX poll loop (20Hz / 50ms tick timeout)
     loop {
-        // Clear revents before polling
         for i in 0..poll_count {
             pollfds[i].revents = 0;
         }
 
         let ret = unsafe { libc::poll(pollfds.as_mut_ptr(), poll_count as libc::nfds_t, 50) };
         let zones = LayoutZones::compute(screen_bounds, state.keyboard_mode);
+        let core_kb_bounds = zones.keyboard_area.map(eg_rect_to_core);
 
         if ret == 0 {
             // 50ms Timeout -> send 20Hz Tick event
-            state.handle_event(UiEvent::Tick, screen_bounds, zones.keyboard_area);
+            state.handle_event(UiEvent::Tick, core_bounds, core_kb_bounds, None);
         } else if ret > 0 {
             for i in 0..poll_count {
                 let pfd = pollfds[i];
@@ -320,23 +327,26 @@ fn run_app() {
                                             let trimmed = line.trim();
                                             if let Some(rest) = trimmed.strip_prefix("rfid ") {
                                                 if let Ok(id) = heapless::String::try_from(rest) {
-                                                    state.handle_event(UiEvent::RfidScanned(id), screen_bounds, zones.keyboard_area);
+                                                    state.handle_event(UiEvent::RfidScanned(id), core_bounds, core_kb_bounds, None);
                                                 }
                                             } else if let Some(rest) = trimmed.strip_prefix("barcode ") {
                                                 if let Ok(data) = heapless::String::try_from(rest) {
-                                                    state.handle_event(UiEvent::BarcodeScanned(data), screen_bounds, zones.keyboard_area);
+                                                    state.handle_event(UiEvent::BarcodeScanned(data), core_bounds, core_kb_bounds, None);
                                                 }
                                             } else if let Some(rest) = trimmed.strip_prefix("type ") {
                                                 if let Ok(data) = heapless::String::try_from(rest) {
-                                                    state.handle_event(UiEvent::BarcodeScanned(data), screen_bounds, zones.keyboard_area);
+                                                    state.handle_event(UiEvent::BarcodeScanned(data), core_bounds, core_kb_bounds, None);
                                                 }
                                             } else if let Some(rest) = trimmed.strip_prefix("click ") {
                                                 let mut parts = rest.split_whitespace();
                                                 if let (Some(x_str), Some(y_str)) = (parts.next(), parts.next()) {
                                                     if let (Ok(x), Ok(y)) = (x_str.parse::<i32>(), y_str.parse::<i32>()) {
-                                                        let pt = Point::new(x, y);
-                                                        state.handle_event(UiEvent::TouchDown { scaled: pt, raw: (x, y) }, screen_bounds, zones.keyboard_area);
-                                                        state.handle_event(UiEvent::TouchUp { scaled: pt, raw: (x, y) }, screen_bounds, zones.keyboard_area);
+                                                        let eg_pt = Point::new(x, y);
+                                                        let core_pt = CorePoint::new(x, y);
+                                                        let key = zones.keyboard_area.and_then(|kb| KeyboardGrid::resolve_key(kb, eg_pt, state.keyboard_mode));
+
+                                                        state.handle_event(UiEvent::TouchDown { scaled: core_pt, raw: (x, y) }, core_bounds, core_kb_bounds, key);
+                                                        state.handle_event(UiEvent::TouchUp { scaled: core_pt, raw: (x, y) }, core_bounds, core_kb_bounds, None);
                                                     }
                                                 }
                                             }
@@ -371,8 +381,9 @@ fn run_app() {
                                     } else if ev.code == 1 || ev.code == 54 {
                                         raw_y = ev.value;
                                     }
-                                    let pt = scale_touch_point(raw_x, raw_y);
-                                    state.handle_event(UiEvent::TouchMove { scaled: pt, raw: (raw_x, raw_y) }, screen_bounds, zones.keyboard_area);
+                                    let eg_pt = scale_touch_point(raw_x, raw_y);
+                                    let core_pt = CorePoint::new(eg_pt.x, eg_pt.y);
+                                    state.handle_event(UiEvent::TouchMove { scaled: core_pt, raw: (raw_x, raw_y) }, core_bounds, core_kb_bounds, None);
                                 }
                                 2 => { // EV_REL
                                     if ev.code == 0 {
@@ -380,16 +391,19 @@ fn run_app() {
                                     } else if ev.code == 1 {
                                         raw_y = (raw_y + ev.value * 10).clamp(0, 32767);
                                     }
-                                    let pt = scale_touch_point(raw_x, raw_y);
-                                    state.handle_event(UiEvent::TouchMove { scaled: pt, raw: (raw_x, raw_y) }, screen_bounds, zones.keyboard_area);
+                                    let eg_pt = scale_touch_point(raw_x, raw_y);
+                                    let core_pt = CorePoint::new(eg_pt.x, eg_pt.y);
+                                    state.handle_event(UiEvent::TouchMove { scaled: core_pt, raw: (raw_x, raw_y) }, core_bounds, core_kb_bounds, None);
                                 }
                                 1 => { // EV_KEY
                                     if ev.code == 330 || ev.code == 272 { // BTN_TOUCH or BTN_LEFT
-                                        let pt = scale_touch_point(raw_x, raw_y);
+                                        let eg_pt = scale_touch_point(raw_x, raw_y);
+                                        let core_pt = CorePoint::new(eg_pt.x, eg_pt.y);
                                         if ev.value == 1 {
-                                            state.handle_event(UiEvent::TouchDown { scaled: pt, raw: (raw_x, raw_y) }, screen_bounds, zones.keyboard_area);
+                                            let key = zones.keyboard_area.and_then(|kb| KeyboardGrid::resolve_key(kb, eg_pt, state.keyboard_mode));
+                                            state.handle_event(UiEvent::TouchDown { scaled: core_pt, raw: (raw_x, raw_y) }, core_bounds, core_kb_bounds, key);
                                         } else if ev.value == 0 {
-                                            state.handle_event(UiEvent::TouchUp { scaled: pt, raw: (raw_x, raw_y) }, screen_bounds, zones.keyboard_area);
+                                            state.handle_event(UiEvent::TouchUp { scaled: core_pt, raw: (raw_x, raw_y) }, core_bounds, core_kb_bounds, None);
                                         }
                                     }
                                 }

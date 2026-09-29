@@ -125,4 +125,23 @@ dependencies = [
  "embedded-graphics-framebuf",
  "heapless",
  "libc",
+ "trillby-core",
+ "trillby-ui",
+]
+
+[[package]]
+name = "trillby-core"
+version = "0.1.0"
+dependencies = [
+ "heapless",
+]
+
+[[package]]
+name = "trillby-ui"
+version = "0.1.0"
+dependencies = [
+ "embedded-graphics",
+ "embedded-graphics-framebuf",
+ "heapless",
+ "trillby-core",
 ]
