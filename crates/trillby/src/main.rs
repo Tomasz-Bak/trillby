@@ -4,6 +4,19 @@
 
 extern crate libc;
 
+// The `libc` crate emits no `-lc` in no_std builds, so declare it ourselves.
+// kind="static" makes rustc wrap it in -Bstatic (a raw `-C link-arg=-lc` lands
+// after rustc's trailing `-Wl,-Bdynamic` and silently links libc.so.6).
+#[cfg(all(not(test), target_feature = "crt-static"))]
+#[link(name = "c", kind = "static", modifiers = "-bundle")]
+#[link(name = "gcc_eh", kind = "static", modifiers = "-bundle")]
+#[link(name = "gcc", kind = "static", modifiers = "-bundle")]
+extern "C" {}
+// libgcc.a calls back into libc.a (__getauxval, pthread_*): close the cycle.
+#[cfg(all(not(test), target_feature = "crt-static"))]
+#[link(name = "c", kind = "static", modifiers = "-bundle")]
+extern "C" {}
+
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
@@ -217,17 +230,21 @@ impl FramebufferWriter {
     }
 }
 
+// Entered via glibc's crt1.o `_start` -> `__libc_start_main` -> `main`.
+// A hand-rolled `_start` is NOT viable with static glibc: it skips IRELATIVE
+// (ifunc) relocation processing and TLS setup, so the first `memcpy`/`write`
+// jumps through an unresolved slot and init dies with SIGSEGV.
+#[cfg(not(test))]
+#[no_mangle]
+pub extern "C" fn main(_argc: libc::c_int, _argv: *const *const libc::c_char) -> libc::c_int {
+    run_app();
+    0
+}
+
+#[cfg(test)]
 #[no_mangle]
 pub extern "C" fn main(_argc: i32, _argv: *const *const u8) -> i32 {
-    #[cfg(test)]
-    {
-        0
-    }
-    #[cfg(not(test))]
-    {
-        run_app();
-        0
-    }
+    0
 }
 
 fn run_app() {
