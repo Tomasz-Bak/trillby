@@ -7,7 +7,7 @@ use embedded_graphics_framebuf::FrameBuf;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use trillby_core::{
-    KeyboardMode, Point as CorePoint, UiEvent, UiState,
+    KeyboardLayer, Point as CorePoint, UiEvent, UiState,
 };
 use trillby_ui::{eg_rect_to_core, UiRenderer};
 
@@ -32,7 +32,7 @@ fn save_ppm_image(path: &str, pixels: &[Rgb565; 800 * 480], width: usize, height
     Ok(())
 }
 
-fn dump_ui_state(mode: KeyboardMode, filename_base: &str) -> std::io::Result<()> {
+fn dump_ui_state(visible: bool, layer: KeyboardLayer, filename_base: &str) -> std::io::Result<()> {
     let width = 800;
     let height = 480;
 
@@ -41,7 +41,8 @@ fn dump_ui_state(mode: KeyboardMode, filename_base: &str) -> std::io::Result<()>
     let mut pixels = [Rgb565::new(0, 0, 0); 800 * 480];
 
     let mut state: UiState<256> = UiState::new();
-    state.keyboard_mode = mode;
+    state.keyboard_visible = visible;
+    state.keyboard_layer = layer;
     let renderer = UiRenderer::new(screen_bounds);
 
     // Populate static demonstration telemetry data
@@ -67,7 +68,7 @@ fn dump_ui_state(mode: KeyboardMode, filename_base: &str) -> std::io::Result<()>
 
     let ppm_path = format!("{}.ppm", filename_base);
     save_ppm_image(&ppm_path, &pixels, width, height)?;
-    println!("Exported Layout Dump -> '{}' (Mode: {:?}, {}x{} PPM)", ppm_path, mode, width, height);
+    println!("Exported Layout Dump -> '{}' (visible: {}, layer: {:?}, {}x{} PPM)", ppm_path, visible, layer, width, height);
 
     Ok(())
 }
@@ -78,13 +79,13 @@ fn main() -> std::io::Result<()> {
     println!("====================================================");
 
     // State 1: Fullscreen Layout (Keyboard Hidden)
-    dump_ui_state(KeyboardMode::Hidden, "layout_fullscreen")?;
+    dump_ui_state(false, KeyboardLayer::Alpha, "layout_fullscreen")?;
 
-    // State 2: Alphabetic QWERTY Layout (Keyboard Standard)
-    dump_ui_state(KeyboardMode::Standard, "layout_keyboard_alpha")?;
+    // State 2: Alphabetic QWERTY layer
+    dump_ui_state(true, KeyboardLayer::Alpha, "layout_keyboard_alpha")?;
 
-    // State 3: Numeric & Symbols Layout (Keyboard Extended)
-    dump_ui_state(KeyboardMode::Extended, "layout_keyboard_numeric")?;
+    // State 3: Numeric & Symbols layer
+    dump_ui_state(true, KeyboardLayer::Symbols, "layout_keyboard_numeric")?;
 
     println!("====================================================");
     Ok(())

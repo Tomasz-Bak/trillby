@@ -37,11 +37,11 @@ fn test_ui_full_interaction_lifecycle() {
     let touch_point = Point::new(40, 320);
     let core_touch_point = CorePoint::new(40, 320);
 
-    let zones = LayoutZones::compute(screen_bounds, state.keyboard_mode);
+    let zones = LayoutZones::compute(screen_bounds, state.keyboard_visible);
     let core_kb_bounds = zones.keyboard_area.map(eg_rect_to_core);
 
     let key_hit = zones.keyboard_area.and_then(|kb| {
-        KeyboardGrid::resolve_key(kb, touch_point, state.keyboard_mode)
+        KeyboardGrid::resolve_key(kb, touch_point, state.keyboard_layer)
     });
     assert_eq!(key_hit, Some(Key::Char('Q')));
 

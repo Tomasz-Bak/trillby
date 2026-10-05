@@ -10,6 +10,8 @@ use embedded_graphics::{
     primitives::{PrimitiveStyleBuilder, Rectangle, StyledDrawable},
     text::Text,
 };
+use trillby_core::header::{HeaderButton, HEADER_HEIGHT};
+use trillby_core::keyboard_types::Key;
 use trillby_core::state::UiState;
 
 pub fn core_point_to_eg(pt: trillby_core::geometry::Point) -> Point {
@@ -57,7 +59,7 @@ impl UiRenderer {
         D: DrawTarget<Color = Rgb565>,
     {
         // Compute 2-State Responsive Layout Zones (Keyboard Hidden vs Active)
-        let zones = LayoutZones::compute(self.screen_bounds, state.keyboard_mode);
+        let zones = LayoutZones::compute(self.screen_bounds, state.keyboard_visible);
 
         // 1. Draw Root Screen Background
         let bg_style = PrimitiveStyleBuilder::new()
@@ -66,7 +68,7 @@ impl UiRenderer {
         self.screen_bounds.draw_styled(&bg_style, target)?;
 
         // 2. Navigation Header Bar (36px high)
-        let header_rect = Rectangle::new(Point::zero(), Size::new(self.screen_bounds.size.width, 36));
+        let header_rect = Rectangle::new(Point::zero(), Size::new(self.screen_bounds.size.width, HEADER_HEIGHT));
         let header_style = PrimitiveStyleBuilder::new()
             .fill_color(self.theme.surface())
             .stroke_color(self.theme.border())
@@ -82,15 +84,15 @@ impl UiRenderer {
             .variant(BadgeVariant::Success)
             .draw(target, &self.theme)?;
 
-        // Header Action Buttons
-        let is_kb_pressed = state.active_touch_key.is_some() && state.last_touch_raw.1 <= 36;
-        Button::new(Rectangle::new(Point::new(510, 4), Size::new(130, 28)), "KEYBOARD")
-            .variant(if state.keyboard_mode != trillby_core::KeyboardMode::Hidden { ButtonVariant::Primary } else { ButtonVariant::Secondary })
-            .pressed(is_kb_pressed)
+        // Header Action Buttons (rects shared with UiState hit-testing)
+        Button::new(core_rect_to_eg(HeaderButton::Keyboard.rect()), "KEYBOARD")
+            .variant(if state.keyboard_visible { ButtonVariant::Primary } else { ButtonVariant::Secondary })
+            .pressed(state.pressed_header == Some(HeaderButton::Keyboard))
             .draw(target, &self.theme)?;
 
-        Button::new(Rectangle::new(Point::new(650, 4), Size::new(130, 28)), "CLEAR")
+        Button::new(core_rect_to_eg(HeaderButton::Clear.rect()), "CLEAR")
             .variant(ButtonVariant::Outline)
+            .pressed(state.pressed_header == Some(HeaderButton::Clear))
             .draw(target, &self.theme)?;
 
         // 3. Responsive Content Viewport
@@ -98,7 +100,7 @@ impl UiRenderer {
         let available_h = zones.content_area.size.height.saturating_sub(content_y);
 
         // Responsive Text Field Input Component
-        let is_input_focused = state.keyboard_mode != trillby_core::KeyboardMode::Hidden;
+        let is_input_focused = state.keyboard_visible;
         TextField::new(Rectangle::new(Point::new(12, content_y as i32), Size::new(776, 40)))
             .value(state.input_buffer.as_str())
             .placeholder("<SCAN BARCODE OR RFID>")
@@ -168,7 +170,7 @@ impl UiRenderer {
             }
         }
 
-        // 4. State 2: Virtual Keyboard Component (when active)
+        // 4. Virtual keyboard: one pass over the shared slot table.
         if let Some(kb_rect) = zones.keyboard_area {
             let kb_bg = PrimitiveStyleBuilder::new()
                 .fill_color(self.theme.surface())
@@ -177,77 +179,26 @@ impl UiRenderer {
                 .build();
             kb_rect.draw_styled(&kb_bg, target)?;
 
-            let key_w = kb_rect.size.width as i32 / KeyboardGrid::COLS as i32;
-            let key_h = kb_rect.size.height as i32 / KeyboardGrid::ROWS as i32;
+            for (cell, slot) in KeyboardGrid::slots(kb_rect, state.keyboard_layer) {
+                let key_rect = Rectangle::new(
+                    cell.top_left + Point::new(2, 2),
+                    cell.size.saturating_sub(Size::new(4, 4)),
+                );
+                let is_pressed = state.active_touch_key.is_some() && state.active_touch_key == slot.resolved();
+                let variant = match slot.key {
+                    Key::Backspace => ButtonVariant::Danger,
+                    Key::Enter => ButtonVariant::Primary,
+                    Key::LayerToggle => ButtonVariant::Outline,
+                    _ if is_pressed => ButtonVariant::Primary,
+                    _ => ButtonVariant::Secondary,
+                };
 
-            // Render Rows 0..3: Character Keys
-            for r in 0..3 {
-                for c in 0..KeyboardGrid::COLS {
-                    let kx = kb_rect.top_left.x + (c as i32 * key_w);
-                    let ky = kb_rect.top_left.y + (r as i32 * key_h);
-                    let krect = Rectangle::new(Point::new(kx + 2, ky + 2), Size::new((key_w - 4) as u32, (key_h - 4) as u32));
-
-                    let resolved_key = KeyboardGrid::resolve_key(kb_rect, Point::new(kx + key_w / 2, ky + key_h / 2), state.keyboard_mode);
-                    let is_pressed = state.active_touch_key.is_some() && state.active_touch_key == resolved_key;
-
-                    let key_variant = if is_pressed {
-                        ButtonVariant::Primary
-                    } else {
-                        ButtonVariant::Secondary
-                    };
-
-                    if let Some(ch) = KeyboardGrid::get_key_char(r, c, state.keyboard_mode) {
-                        let mut buf = [0u8; 4];
-                        let label_str: &str = ch.encode_utf8(&mut buf);
-                        Button::new(krect, label_str)
-                            .variant(key_variant)
-                            .pressed(is_pressed)
-                            .draw(target, &self.theme)?;
-                    } else {
-                        Button::new(krect, "")
-                            .variant(key_variant)
-                            .pressed(is_pressed)
-                            .draw(target, &self.theme)?;
-                    }
-                }
+                let mut label_buf = [0u8; 4];
+                Button::new(key_rect, slot.label(state.keyboard_layer, &mut label_buf))
+                    .variant(variant)
+                    .pressed(is_pressed)
+                    .draw(target, &self.theme)?;
             }
-
-            // Render Row 3: Control Buttons Row (MODE, SPACE, DEL, ENTER)
-            let r3_y = kb_rect.top_left.y + (3 * key_h);
-            let unit_w = kb_rect.size.width as i32 / 10;
-
-            // 1. MODE Switch
-            let mode_rect = Rectangle::new(Point::new(kb_rect.top_left.x + 2, r3_y + 2), Size::new((unit_w * 2 - 4) as u32, (key_h - 4) as u32));
-            let mode_label = if state.keyboard_mode == trillby_core::KeyboardMode::Standard { "?123" } else { "ABC" };
-            let is_mode_pressed = state.active_touch_key == Some(trillby_core::Key::ModeSwitch);
-            Button::new(mode_rect, mode_label)
-                .variant(ButtonVariant::Outline)
-                .pressed(is_mode_pressed)
-                .draw(target, &self.theme)?;
-
-            // 2. SPACE Bar
-            let space_rect = Rectangle::new(Point::new(kb_rect.top_left.x + unit_w * 2 + 2, r3_y + 2), Size::new((unit_w * 4 - 4) as u32, (key_h - 4) as u32));
-            let is_space_pressed = state.active_touch_key == Some(trillby_core::Key::Space);
-            Button::new(space_rect, "SPACE")
-                .variant(if is_space_pressed { ButtonVariant::Primary } else { ButtonVariant::Secondary })
-                .pressed(is_space_pressed)
-                .draw(target, &self.theme)?;
-
-            // 3. BACKSPACE (DEL) Key
-            let bk_rect = Rectangle::new(Point::new(kb_rect.top_left.x + unit_w * 6 + 2, r3_y + 2), Size::new((unit_w * 2 - 4) as u32, (key_h - 4) as u32));
-            let is_bk_pressed = state.active_touch_key == Some(trillby_core::Key::Backspace);
-            Button::new(bk_rect, "DEL")
-                .variant(ButtonVariant::Danger)
-                .pressed(is_bk_pressed)
-                .draw(target, &self.theme)?;
-
-            // 4. ENTER Key
-            let enter_rect = Rectangle::new(Point::new(kb_rect.top_left.x + unit_w * 8 + 2, r3_y + 2), Size::new((unit_w * 2 - 4) as u32, (key_h - 4) as u32));
-            let is_enter_pressed = state.active_touch_key == Some(trillby_core::Key::Enter);
-            Button::new(enter_rect, "ENTER")
-                .variant(ButtonVariant::Primary)
-                .pressed(is_enter_pressed)
-                .draw(target, &self.theme)?;
         }
 
         Ok(())
