@@ -1,6 +1,6 @@
 use crate::keyboard_grid::KeyboardGrid;
 use crate::layout::LayoutZones;
-use crate::theme::{ColorScheme, DarkFloorTheme};
+use crate::theme::{DarkFloorTheme, Theme};
 use crate::widgets::{Badge, BadgeVariant, Button, ButtonVariant, Card, TextField};
 use embedded_graphics::{
     geometry::{Point, Size},

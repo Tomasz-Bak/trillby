@@ -1,7 +1,7 @@
-use crate::theme::ColorScheme;
+use crate::theme::Theme;
 use embedded_graphics::{
-    geometry::{Point, Size},
-    mono_font::{ascii::FONT_8X13, MonoTextStyle},
+    geometry::Point,
+    mono_font::MonoTextStyle,
     pixelcolor::Rgb565,
     prelude::*,
     primitives::{PrimitiveStyleBuilder, Rectangle, RoundedRectangle},
@@ -48,7 +48,7 @@ impl<'a> Button<'a> {
     pub fn draw<D, C>(&self, target: &mut D, theme: &C) -> Result<(), D::Error>
     where
         D: DrawTarget<Color = Rgb565>,
-        C: ColorScheme<Color = Rgb565>,
+        C: Theme,
     {
         let (bg_color, stroke_color, text_color) = match (self.variant, self.is_pressed) {
             (ButtonVariant::Primary, false) => (theme.primary(), theme.primary(), theme.primary_text()),
@@ -69,17 +69,18 @@ impl<'a> Button<'a> {
             .stroke_width(1)
             .build();
 
-        RoundedRectangle::with_equal_corners(self.bounds, Size::new(4, 4))
+        RoundedRectangle::with_equal_corners(self.bounds, theme.radius_sm())
             .into_styled(style)
             .draw(target)?;
 
-        let font_style = MonoTextStyle::new(&FONT_8X13, text_color);
-        let char_w = 8;
-        let char_h = 13;
+        let font = theme.font_medium();
+        let font_style = MonoTextStyle::new(font, text_color);
+        let char_w = font.character_size.width as i32;
+        let char_h = font.character_size.height as i32;
         let text_w = (self.label.len() as i32) * char_w;
 
         let tx = self.bounds.top_left.x + (self.bounds.size.width as i32 - text_w) / 2;
-        let ty = self.bounds.top_left.y + (self.bounds.size.height as i32 + char_h) / 2 - 2;
+        let ty = self.bounds.top_left.y + (self.bounds.size.height as i32 - char_h) / 2 + font.baseline as i32;
 
         Text::new(self.label, Point::new(tx, ty), font_style).draw(target)?;
 
