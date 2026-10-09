@@ -1,7 +1,7 @@
-use crate::theme::ColorScheme;
+use crate::theme::Theme;
 use embedded_graphics::{
-    geometry::{Point, Size},
-    mono_font::{ascii::FONT_6X12, ascii::FONT_9X18_BOLD, MonoTextStyle},
+    geometry::Point,
+    mono_font::MonoTextStyle,
     pixelcolor::Rgb565,
     prelude::*,
     primitives::{PrimitiveStyleBuilder, Rectangle, RoundedRectangle},
@@ -50,12 +50,14 @@ impl<'a> TextField<'a> {
     pub fn draw<D, C>(&self, target: &mut D, theme: &C) -> Result<(), D::Error>
     where
         D: DrawTarget<Color = Rgb565>,
-        C: ColorScheme<Color = Rgb565>,
+        C: Theme,
     {
         // 1. Optional Header Label
         if let Some(lbl) = self.label {
-            let label_style = MonoTextStyle::new(&FONT_6X12, theme.text_muted());
-            Text::new(lbl, Point::new(self.bounds.top_left.x, self.bounds.top_left.y - 4), label_style).draw(target)?;
+            let font = theme.font_small();
+            let label_style = MonoTextStyle::new(font, theme.text_muted());
+            let pad_v = theme.spacing_sm() as i32;
+            Text::new(lbl, Point::new(self.bounds.top_left.x, self.bounds.top_left.y - pad_v), label_style).draw(target)?;
         }
 
         // 2. Input Container Outer Box
@@ -71,7 +73,7 @@ impl<'a> TextField<'a> {
             .stroke_width(stroke_width)
             .build();
 
-        RoundedRectangle::with_equal_corners(self.bounds, Size::new(4, 4))
+        RoundedRectangle::with_equal_corners(self.bounds, theme.radius_sm())
             .into_styled(style)
             .draw(target)?;
 
@@ -82,10 +84,14 @@ impl<'a> TextField<'a> {
             (self.value, theme.primary())
         };
 
-        let val_style = MonoTextStyle::new(&FONT_9X18_BOLD, text_color);
-        let ty = self.bounds.top_left.y + (self.bounds.size.height as i32 + 18) / 2 - 2;
+        let font = theme.font_large();
+        let val_style = MonoTextStyle::new(font, text_color);
+        let char_h = font.character_size.height as i32;
+        let pad_h = theme.spacing_md() as i32;
+        
+        let ty = self.bounds.top_left.y + (self.bounds.size.height as i32 - char_h) / 2 + font.baseline as i32;
 
-        Text::new(disp_str, Point::new(self.bounds.top_left.x + 10, ty), val_style).draw(target)?;
+        Text::new(disp_str, Point::new(self.bounds.top_left.x + pad_h, ty), val_style).draw(target)?;
 
         Ok(())
     }

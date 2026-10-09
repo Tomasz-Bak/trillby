@@ -1,84 +1,41 @@
-use embedded_graphics::pixelcolor::{PixelColor, Rgb565, RgbColor};
+use embedded_graphics::geometry::Size;
+use embedded_graphics::mono_font::{
+    ascii::{FONT_6X12, FONT_8X13, FONT_9X18_BOLD},
+    MonoFont,
+};
+use embedded_graphics::pixelcolor::{Rgb565, RgbColor};
 
-/// Semantic color palette trait for zero-cost UI styling.
-pub trait ColorScheme {
-    type Color: PixelColor;
+/// Semantic theme trait for zero-cost UI styling.
+pub trait Theme {
+    #[inline] fn background(&self) -> Rgb565 { Rgb565::new(3, 10, 7) } // #1E293B
+    #[inline] fn surface(&self) -> Rgb565 { Rgb565::new(6, 16, 10) } // #334155
+    #[inline] fn surface_active(&self) -> Rgb565 { Rgb565::new(8, 21, 13) } // #475569
+    #[inline] fn primary(&self) -> Rgb565 { Rgb565::new(12, 25, 29) } // #6366F1
+    #[inline] fn primary_text(&self) -> Rgb565 { Rgb565::WHITE } // #FFFFFF
+    #[inline] fn text(&self) -> Rgb565 { Rgb565::WHITE } // #FFFFFF
+    #[inline] fn text_muted(&self) -> Rgb565 { Rgb565::new(24, 52, 27) } // #CBD5E1
+    #[inline] fn border(&self) -> Rgb565 { Rgb565::new(12, 28, 17) } // #64748B
+    #[inline] fn warning(&self) -> Rgb565 { Rgb565::new(30, 39, 1) } // #F59E0B
+    #[inline] fn success(&self) -> Rgb565 { Rgb565::new(2, 46, 16) } // #10B981
 
-    fn background(&self) -> Self::Color;
-    fn surface(&self) -> Self::Color;
-    fn surface_active(&self) -> Self::Color;
-    fn primary(&self) -> Self::Color;
-    fn primary_text(&self) -> Self::Color;
-    fn text(&self) -> Self::Color;
-    fn text_muted(&self) -> Self::Color;
-    fn border(&self) -> Self::Color;
-    fn warning(&self) -> Self::Color;
-    fn success(&self) -> Self::Color;
+    // Geometry & Spacing
+    #[inline] fn radius_sm(&self) -> Size { Size::new(4, 4) }
+    #[inline] fn radius_md(&self) -> Size { Size::new(6, 6) }
+    #[inline] fn radius_lg(&self) -> Size { Size::new(8, 8) }
+    #[inline] fn spacing_sm(&self) -> u32 { 4 }
+    #[inline] fn spacing_md(&self) -> u32 { 8 }
+    #[inline] fn spacing_lg(&self) -> u32 { 12 }
+    #[inline] fn spacing_xl(&self) -> u32 { 16 }
+
+    // Fonts
+    #[inline] fn font_small(&self) -> &'static MonoFont<'static> { &FONT_6X12 }
+    #[inline] fn font_medium(&self) -> &'static MonoFont<'static> { &FONT_8X13 }
+    #[inline] fn font_large(&self) -> &'static MonoFont<'static> { &FONT_9X18_BOLD }
 }
 
 /// Slate Blue Web Theme using calibrated 16-bit RGB565 colors (Slate 800 Navy Canvas & Indigo palette).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DarkFloorTheme;
 
-impl ColorScheme for DarkFloorTheme {
-    type Color = Rgb565;
+impl Theme for DarkFloorTheme {}
 
-    #[inline]
-    fn background(&self) -> Self::Color {
-        // Distinct Navy/Slate Blue Canvas (#1E293B - Slate 800, NOT black)
-        Rgb565::new(3, 10, 7)
-    }
-
-    #[inline]
-    fn surface(&self) -> Self::Color {
-        // Elevated Slate Surface Card (#334155 - Slate 700)
-        Rgb565::new(6, 16, 10)
-    }
-
-    #[inline]
-    fn surface_active(&self) -> Self::Color {
-        // Active Button / Pressed Card (#475569 - Slate 600)
-        Rgb565::new(8, 21, 13)
-    }
-
-    #[inline]
-    fn primary(&self) -> Self::Color {
-        // Vibrant Indigo Primary Accent (#6366F1)
-        Rgb565::new(12, 25, 29)
-    }
-
-    #[inline]
-    fn primary_text(&self) -> Self::Color {
-        Rgb565::WHITE
-    }
-
-    #[inline]
-    fn text(&self) -> Self::Color {
-        // Crisp High-Contrast White (#FFFFFF)
-        Rgb565::WHITE
-    }
-
-    #[inline]
-    fn text_muted(&self) -> Self::Color {
-        // Soft Slate Text (#CBD5E1 - Slate 300)
-        Rgb565::new(24, 52, 27)
-    }
-
-    #[inline]
-    fn border(&self) -> Self::Color {
-        // Visible Slate Border (#64748B - Slate 500)
-        Rgb565::new(12, 28, 17)
-    }
-
-    #[inline]
-    fn warning(&self) -> Self::Color {
-        // Warm Amber (#F59E0B)
-        Rgb565::new(30, 39, 1)
-    }
-
-    #[inline]
-    fn success(&self) -> Self::Color {
-        // Emerald Success (#10B981)
-        Rgb565::new(2, 46, 16)
-    }
-}
