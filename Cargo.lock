@@ -126,6 +126,7 @@ dependencies = [
  "heapless",
  "libc",
  "trillby-core",
+ "trillby-net",
  "trillby-ui",
 ]
 
@@ -134,6 +135,15 @@ name = "trillby-core"
 version = "0.1.0"
 dependencies = [
  "heapless",
+]
+
+[[package]]
+name = "trillby-net"
+version = "0.1.0"
+dependencies = [
+ "heapless",
+ "libc",
+ "trillby-core",
 ]
 
 [[package]]

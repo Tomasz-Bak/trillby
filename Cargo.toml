@@ -2,6 +2,7 @@
 members = [
     "crates/trillby-core",
     "crates/trillby-ui",
+    "crates/trillby-net",
     "crates/trillby",
 ]
 resolver = "2"
