@@ -1,8 +1,8 @@
 use std::net::TcpListener;
 use std::io::{Read, Write};
-use trillby_net::crypto::{hkdf_expand, hkdf_extract, sha256};
+use trillby_net::crypto::sha256;
 use trillby_net::packet::{
-    decrypt_and_unpack, pack_and_encrypt, AckPayload, HandshakeInitPayload,
+    decrypt_and_unpack, derive_session_key, pack_and_encrypt, AckPayload, HandshakeInitPayload,
     HandshakeRespPayload, MsgType, WorkStartPayload, HEADER_LEN, MAX_FRAME_LEN,
 };
 use trillby_net::{ClientState, NetClient};
@@ -88,12 +88,11 @@ fn test_end_to_end_handshake_and_work_event_flow() {
     assert_eq!(status_change, Some(NetworkStatus::Online));
 
     // Server derives the exact same session key
-    let mut ikm = [0u8; 64];
-    ikm[..32].copy_from_slice(&init_payload.client_nonce);
-    ikm[32..64].copy_from_slice(&server_nonce);
-    let prk = hkdf_extract(&session_salt, &ikm);
-    let mut server_session_key = [0u8; 32];
-    hkdf_expand(&prk, b"TRILLBY_SESSION_KEY_V1", &mut server_session_key).unwrap();
+    let server_session_key = derive_session_key(
+        &session_salt,
+        &init_payload.client_nonce,
+        &server_nonce,
+    );
 
     // Step 7: Client enqueues WorkStart event
     let mut wo_id = [0u8; 32];

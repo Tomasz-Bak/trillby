@@ -5,11 +5,10 @@
 //! Implements PSK + HKDF-SHA256 key establishment, automatic OTA rekeying,
 //! offline outbox queuing, and anti-replay sequence tracking.
 
-use crate::crypto::{hkdf_expand, hkdf_extract};
 use crate::outbox::{Outbox, OutboxError};
 use crate::packet::{
-    decrypt_and_unpack, pack_and_encrypt, AckPayload, HandshakeInitPayload,
-    HandshakeRespPayload, MsgType, HEADER_LEN, MAX_FRAME_LEN,
+    decrypt_and_unpack, derive_session_key, generate_client_nonce, pack_and_encrypt, AckPayload,
+    HandshakeInitPayload, HandshakeRespPayload, MsgType, HEADER_LEN, MAX_FRAME_LEN,
 };
 use crate::posix::PosixSocket;
 use trillby_core::net_types::NetworkStatus;
@@ -198,12 +197,7 @@ impl<const OUTBOX_CAP: usize> NetClient<OUTBOX_CAP> {
     }
 
     fn send_handshake_init(&mut self, now_ms: u64) {
-        // Generate pseudo-random client nonce derived from PSK + UUID + monotonic timestamp
-        let mut prk_input = [0u8; 64];
-        prk_input[..32].copy_from_slice(&self.psk);
-        prk_input[32..48].copy_from_slice(&self.device_uuid);
-        prk_input[48..56].copy_from_slice(&now_ms.to_le_bytes());
-        self.client_nonce = crate::crypto::sha256(&prk_input);
+        self.client_nonce = generate_client_nonce(&self.psk, &self.device_uuid, now_ms);
 
         let init_payload = HandshakeInitPayload {
             client_nonce: self.client_nonce,
@@ -237,15 +231,11 @@ impl<const OUTBOX_CAP: usize> NetClient<OUTBOX_CAP> {
                         if let Ok(resp) = HandshakeRespPayload::decode(pt) {
                             self.session_id = resp.assigned_session_id;
                             self.session_salt = resp.session_salt;
-
-                            // Derive Session Key: HKDF(PSK, client_nonce || server_nonce)
-                            let mut ikm = [0u8; 64];
-                            ikm[..32].copy_from_slice(&self.client_nonce);
-                            ikm[32..64].copy_from_slice(&resp.server_nonce);
-
-                            let prk = hkdf_extract(&resp.session_salt, &ikm);
-                            let info = b"TRILLBY_SESSION_KEY_V1";
-                            let _ = hkdf_expand(&prk, info, &mut self.session_key);
+                            self.session_key = derive_session_key(
+                                &resp.session_salt,
+                                &self.client_nonce,
+                                &resp.server_nonce,
+                            );
 
                             self.tx_seq = 1;
                             self.rx_seq = 0;

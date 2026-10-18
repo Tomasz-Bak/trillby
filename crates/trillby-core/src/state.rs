@@ -104,7 +104,7 @@ impl<const N: usize> UiState<N> {
             UiEvent::Tick => {
                 self.tick_count = self.tick_count.saturating_add(1);
                 // Trigger 1Hz periodic UI refresh based on centralized poll frequency
-                if self.tick_count % (crate::POLL_FREQ_HZ as u64) == 0 {
+                if self.tick_count.is_multiple_of(crate::POLL_FREQ_HZ as u64) {
                     self.dirty = true;
                 }
             }

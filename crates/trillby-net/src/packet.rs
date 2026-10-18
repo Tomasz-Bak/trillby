@@ -4,7 +4,10 @@
 //! The 16-byte FrameHeader serves as the Associated Authenticated Data (AAD)
 //! for ChaCha20-Poly1305.
 
-use crate::crypto::{chacha20_poly1305_decrypt, chacha20_poly1305_encrypt};
+use crate::crypto::{
+    chacha20_poly1305_decrypt, chacha20_poly1305_encrypt,
+    hkdf_expand, hkdf_extract, sha256,
+};
 
 pub const FRAME_MAGIC: [u8; 2] = [0x54, 0x52]; // "TR"
 pub const PROTOCOL_VERSION: u8 = 0x01;
@@ -61,6 +64,152 @@ impl TryFrom<u8> for MsgType {
     }
 }
 
+// ===========================================================================
+// Zero-Allocation Sequential Byte Codec
+// ===========================================================================
+
+/// A zero-allocation, sequential byte writer over a mutable slice.
+#[derive(Debug)]
+pub struct ByteWriter<'a> {
+    buf: &'a mut [u8],
+    offset: usize,
+}
+
+impl<'a> ByteWriter<'a> {
+    #[inline]
+    pub fn new(buf: &'a mut [u8]) -> Self {
+        Self { buf, offset: 0 }
+    }
+
+    #[inline]
+    pub fn offset(&self) -> usize {
+        self.offset
+    }
+
+    #[inline]
+    pub fn remaining(&self) -> usize {
+        self.buf.len().saturating_sub(self.offset)
+    }
+
+    #[inline]
+    pub fn write_u8(&mut self, val: u8) -> Result<(), PacketError> {
+        if self.remaining() < 1 {
+            return Err(PacketError::BufferTooShort);
+        }
+        self.buf[self.offset] = val;
+        self.offset += 1;
+        Ok(())
+    }
+
+    #[inline]
+    pub fn write_i8(&mut self, val: i8) -> Result<(), PacketError> {
+        self.write_u8(val as u8)
+    }
+
+    #[inline]
+    pub fn write_u16_le(&mut self, val: u16) -> Result<(), PacketError> {
+        self.write_bytes(&val.to_le_bytes())
+    }
+
+    #[inline]
+    pub fn write_u32_le(&mut self, val: u32) -> Result<(), PacketError> {
+        self.write_bytes(&val.to_le_bytes())
+    }
+
+    #[inline]
+    pub fn write_u64_le(&mut self, val: u64) -> Result<(), PacketError> {
+        self.write_bytes(&val.to_le_bytes())
+    }
+
+    #[inline]
+    pub fn write_bytes(&mut self, src: &[u8]) -> Result<(), PacketError> {
+        if self.remaining() < src.len() {
+            return Err(PacketError::BufferTooShort);
+        }
+        self.buf[self.offset..self.offset + src.len()].copy_from_slice(src);
+        self.offset += src.len();
+        Ok(())
+    }
+}
+
+/// A zero-allocation, sequential byte reader over an immutable slice.
+#[derive(Debug)]
+pub struct ByteReader<'a> {
+    buf: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> ByteReader<'a> {
+    #[inline]
+    pub fn new(buf: &'a [u8]) -> Self {
+        Self { buf, offset: 0 }
+    }
+
+    #[inline]
+    pub fn offset(&self) -> usize {
+        self.offset
+    }
+
+    #[inline]
+    pub fn remaining(&self) -> usize {
+        self.buf.len().saturating_sub(self.offset)
+    }
+
+    #[inline]
+    pub fn read_u8(&mut self) -> Result<u8, PacketError> {
+        if self.remaining() < 1 {
+            return Err(PacketError::BufferTooShort);
+        }
+        let b = self.buf[self.offset];
+        self.offset += 1;
+        Ok(b)
+    }
+
+    #[inline]
+    pub fn read_i8(&mut self) -> Result<i8, PacketError> {
+        self.read_u8().map(|b| b as i8)
+    }
+
+    #[inline]
+    pub fn read_u16_le(&mut self) -> Result<u16, PacketError> {
+        let bytes = self.read_array::<2>()?;
+        Ok(u16::from_le_bytes(bytes))
+    }
+
+    #[inline]
+    pub fn read_u32_le(&mut self) -> Result<u32, PacketError> {
+        let bytes = self.read_array::<4>()?;
+        Ok(u32::from_le_bytes(bytes))
+    }
+
+    #[inline]
+    pub fn read_u64_le(&mut self) -> Result<u64, PacketError> {
+        let bytes = self.read_array::<8>()?;
+        Ok(u64::from_le_bytes(bytes))
+    }
+
+    #[inline]
+    pub fn read_array<const N: usize>(&mut self) -> Result<[u8; N], PacketError> {
+        if self.remaining() < N {
+            return Err(PacketError::BufferTooShort);
+        }
+        let mut arr = [0u8; N];
+        arr.copy_from_slice(&self.buf[self.offset..self.offset + N]);
+        self.offset += N;
+        Ok(arr)
+    }
+
+    #[inline]
+    pub fn read_slice(&mut self, len: usize) -> Result<&'a [u8], PacketError> {
+        if self.remaining() < len {
+            return Err(PacketError::BufferTooShort);
+        }
+        let slice = &self.buf[self.offset..self.offset + len];
+        self.offset += len;
+        Ok(slice)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameHeader {
     pub msg_type: MsgType,
@@ -83,31 +232,37 @@ impl FrameHeader {
     }
 
     pub fn encode(&self, out: &mut [u8; HEADER_LEN]) {
-        out[0] = FRAME_MAGIC[0];
-        out[1] = FRAME_MAGIC[1];
-        out[2] = PROTOCOL_VERSION;
-        out[3] = self.msg_type as u8;
-        out[4..8].copy_from_slice(&self.session_id.to_le_bytes());
-        out[8..12].copy_from_slice(&self.seq_num.to_le_bytes());
-        out[12..14].copy_from_slice(&self.payload_len.to_le_bytes());
-        out[14..16].copy_from_slice(&self.flags.to_le_bytes());
+        let mut w = ByteWriter::new(out);
+        let _ = w.write_bytes(&FRAME_MAGIC);
+        let _ = w.write_u8(PROTOCOL_VERSION);
+        let _ = w.write_u8(self.msg_type as u8);
+        let _ = w.write_u32_le(self.session_id);
+        let _ = w.write_u32_le(self.seq_num);
+        let _ = w.write_u16_le(self.payload_len);
+        let _ = w.write_u16_le(self.flags);
     }
 
-    pub fn decode(bytes: &[u8; HEADER_LEN]) -> Result<Self, PacketError> {
-        if bytes[0] != FRAME_MAGIC[0] || bytes[1] != FRAME_MAGIC[1] {
+    pub fn decode(bytes: &[u8]) -> Result<Self, PacketError> {
+        if bytes.len() < HEADER_LEN {
+            return Err(PacketError::BufferTooShort);
+        }
+        let mut r = ByteReader::new(bytes);
+        let magic = r.read_array::<2>()?;
+        if magic != FRAME_MAGIC {
             return Err(PacketError::InvalidMagic);
         }
-        if bytes[2] != PROTOCOL_VERSION {
+        let version = r.read_u8()?;
+        if version != PROTOCOL_VERSION {
             return Err(PacketError::UnsupportedVersion);
         }
-        let msg_type = MsgType::try_from(bytes[3])?;
-        let session_id = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
-        let seq_num = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
-        let payload_len = u16::from_le_bytes(bytes[12..14].try_into().unwrap());
+        let msg_type = MsgType::try_from(r.read_u8()?)?;
+        let session_id = r.read_u32_le()?;
+        let seq_num = r.read_u32_le()?;
+        let payload_len = r.read_u16_le()?;
         if payload_len > MAX_PAYLOAD_LEN {
             return Err(PacketError::PayloadTooLarge);
         }
-        let flags = u16::from_le_bytes(bytes[14..16].try_into().unwrap());
+        let flags = r.read_u16_le()?;
 
         Ok(Self {
             msg_type,
@@ -121,9 +276,10 @@ impl FrameHeader {
     /// Derive standard 12-byte AEAD nonce: [salt (4B) || session_id (4B) || seq_num (4B)]
     pub fn derive_nonce(&self, salt: &[u8; 4]) -> [u8; 12] {
         let mut nonce = [0u8; 12];
-        nonce[0..4].copy_from_slice(salt);
-        nonce[4..8].copy_from_slice(&self.session_id.to_le_bytes());
-        nonce[8..12].copy_from_slice(&self.seq_num.to_le_bytes());
+        let mut w = ByteWriter::new(&mut nonce);
+        let _ = w.write_bytes(salt);
+        let _ = w.write_u32_le(self.session_id);
+        let _ = w.write_u32_le(self.seq_num);
         nonce
     }
 }
@@ -142,22 +298,16 @@ impl HandshakeInitPayload {
     pub const LEN: usize = 48;
 
     pub fn encode(&self, out: &mut [u8]) -> Result<(), PacketError> {
-        if out.len() < Self::LEN {
-            return Err(PacketError::BufferTooShort);
-        }
-        out[0..32].copy_from_slice(&self.client_nonce);
-        out[32..48].copy_from_slice(&self.device_uuid);
+        let mut w = ByteWriter::new(out);
+        w.write_bytes(&self.client_nonce)?;
+        w.write_bytes(&self.device_uuid)?;
         Ok(())
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, PacketError> {
-        if bytes.len() < Self::LEN {
-            return Err(PacketError::BufferTooShort);
-        }
-        let mut client_nonce = [0u8; 32];
-        client_nonce.copy_from_slice(&bytes[0..32]);
-        let mut device_uuid = [0u8; 16];
-        device_uuid.copy_from_slice(&bytes[32..48]);
+        let mut r = ByteReader::new(bytes);
+        let client_nonce = r.read_array::<32>()?;
+        let device_uuid = r.read_array::<16>()?;
         Ok(Self { client_nonce, device_uuid })
     }
 }
@@ -173,24 +323,18 @@ impl HandshakeRespPayload {
     pub const LEN: usize = 40;
 
     pub fn encode(&self, out: &mut [u8]) -> Result<(), PacketError> {
-        if out.len() < Self::LEN {
-            return Err(PacketError::BufferTooShort);
-        }
-        out[0..32].copy_from_slice(&self.server_nonce);
-        out[32..36].copy_from_slice(&self.assigned_session_id.to_le_bytes());
-        out[36..40].copy_from_slice(&self.session_salt);
+        let mut w = ByteWriter::new(out);
+        w.write_bytes(&self.server_nonce)?;
+        w.write_u32_le(self.assigned_session_id)?;
+        w.write_bytes(&self.session_salt)?;
         Ok(())
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, PacketError> {
-        if bytes.len() < Self::LEN {
-            return Err(PacketError::BufferTooShort);
-        }
-        let mut server_nonce = [0u8; 32];
-        server_nonce.copy_from_slice(&bytes[0..32]);
-        let assigned_session_id = u32::from_le_bytes(bytes[32..36].try_into().unwrap());
-        let mut session_salt = [0u8; 4];
-        session_salt.copy_from_slice(&bytes[36..40]);
+        let mut r = ByteReader::new(bytes);
+        let server_nonce = r.read_array::<32>()?;
+        let assigned_session_id = r.read_u32_le()?;
+        let session_salt = r.read_array::<4>()?;
         Ok(Self {
             server_nonce,
             assigned_session_id,
@@ -210,23 +354,18 @@ impl OperatorAuthPayload {
     pub const LEN: usize = 25; // 1 + 16 + 8
 
     pub fn encode(&self, out: &mut [u8]) -> Result<(), PacketError> {
-        if out.len() < Self::LEN {
-            return Err(PacketError::BufferTooShort);
-        }
-        out[0] = self.card_id_len;
-        out[1..17].copy_from_slice(&self.card_id);
-        out[17..25].copy_from_slice(&self.timestamp_ms.to_le_bytes());
+        let mut w = ByteWriter::new(out);
+        w.write_u8(self.card_id_len)?;
+        w.write_bytes(&self.card_id)?;
+        w.write_u64_le(self.timestamp_ms)?;
         Ok(())
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, PacketError> {
-        if bytes.len() < Self::LEN {
-            return Err(PacketError::BufferTooShort);
-        }
-        let card_id_len = bytes[0];
-        let mut card_id = [0u8; 16];
-        card_id.copy_from_slice(&bytes[1..17]);
-        let timestamp_ms = u64::from_le_bytes(bytes[17..25].try_into().unwrap());
+        let mut r = ByteReader::new(bytes);
+        let card_id_len = r.read_u8()?;
+        let card_id = r.read_array::<16>()?;
+        let timestamp_ms = r.read_u64_le()?;
         Ok(Self { card_id, card_id_len, timestamp_ms })
     }
 }
@@ -244,28 +383,22 @@ impl WorkStartPayload {
     pub const LEN: usize = 58; // 1 + 32 + 1 + 16 + 8
 
     pub fn encode(&self, out: &mut [u8]) -> Result<(), PacketError> {
-        if out.len() < Self::LEN {
-            return Err(PacketError::BufferTooShort);
-        }
-        out[0] = self.work_order_len;
-        out[1..33].copy_from_slice(&self.work_order_id);
-        out[33] = self.operator_id_len;
-        out[34..50].copy_from_slice(&self.operator_id);
-        out[50..58].copy_from_slice(&self.timestamp_ms.to_le_bytes());
+        let mut w = ByteWriter::new(out);
+        w.write_u8(self.work_order_len)?;
+        w.write_bytes(&self.work_order_id)?;
+        w.write_u8(self.operator_id_len)?;
+        w.write_bytes(&self.operator_id)?;
+        w.write_u64_le(self.timestamp_ms)?;
         Ok(())
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, PacketError> {
-        if bytes.len() < Self::LEN {
-            return Err(PacketError::BufferTooShort);
-        }
-        let work_order_len = bytes[0];
-        let mut work_order_id = [0u8; 32];
-        work_order_id.copy_from_slice(&bytes[1..33]);
-        let operator_id_len = bytes[33];
-        let mut operator_id = [0u8; 16];
-        operator_id.copy_from_slice(&bytes[34..50]);
-        let timestamp_ms = u64::from_le_bytes(bytes[50..58].try_into().unwrap());
+        let mut r = ByteReader::new(bytes);
+        let work_order_len = r.read_u8()?;
+        let work_order_id = r.read_array::<32>()?;
+        let operator_id_len = r.read_u8()?;
+        let operator_id = r.read_array::<16>()?;
+        let timestamp_ms = r.read_u64_le()?;
         Ok(Self {
             work_order_len,
             work_order_id,
@@ -288,24 +421,20 @@ impl HeartbeatPayload {
     pub const LEN: usize = 8; // 1 + 1 + 2 + 4
 
     pub fn encode(&self, out: &mut [u8]) -> Result<(), PacketError> {
-        if out.len() < Self::LEN {
-            return Err(PacketError::BufferTooShort);
-        }
-        out[0] = self.battery_pct;
-        out[1] = self.rssi as u8;
-        out[2..4].copy_from_slice(&self.pending_outbox.to_le_bytes());
-        out[4..8].copy_from_slice(&self.uptime_s.to_le_bytes());
+        let mut w = ByteWriter::new(out);
+        w.write_u8(self.battery_pct)?;
+        w.write_i8(self.rssi)?;
+        w.write_u16_le(self.pending_outbox)?;
+        w.write_u32_le(self.uptime_s)?;
         Ok(())
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, PacketError> {
-        if bytes.len() < Self::LEN {
-            return Err(PacketError::BufferTooShort);
-        }
-        let battery_pct = bytes[0];
-        let rssi = bytes[1] as i8;
-        let pending_outbox = u16::from_le_bytes(bytes[2..4].try_into().unwrap());
-        let uptime_s = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        let mut r = ByteReader::new(bytes);
+        let battery_pct = r.read_u8()?;
+        let rssi = r.read_i8()?;
+        let pending_outbox = r.read_u16_le()?;
+        let uptime_s = r.read_u32_le()?;
         Ok(Self {
             battery_pct,
             rssi,
@@ -325,22 +454,58 @@ impl AckPayload {
     pub const LEN: usize = 5;
 
     pub fn encode(&self, out: &mut [u8]) -> Result<(), PacketError> {
-        if out.len() < Self::LEN {
-            return Err(PacketError::BufferTooShort);
-        }
-        out[0..4].copy_from_slice(&self.acked_seq.to_le_bytes());
-        out[4] = self.status;
+        let mut w = ByteWriter::new(out);
+        w.write_u32_le(self.acked_seq)?;
+        w.write_u8(self.status)?;
         Ok(())
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, PacketError> {
-        if bytes.len() < Self::LEN {
-            return Err(PacketError::BufferTooShort);
-        }
-        let acked_seq = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
-        let status = bytes[4];
+        let mut r = ByteReader::new(bytes);
+        let acked_seq = r.read_u32_le()?;
+        let status = r.read_u8()?;
         Ok(Self { acked_seq, status })
     }
+}
+
+// ===========================================================================
+// Key Derivation & Nonce Helpers
+// ===========================================================================
+
+pub const SESSION_KEY_INFO: &[u8] = b"TRILLBY_SESSION_KEY_V1";
+
+/// Derive the symmetric session key using HKDF-SHA256:
+/// PRK = HKDF-Extract(salt, client_nonce || server_nonce)
+/// Key = HKDF-Expand(PRK, "TRILLBY_SESSION_KEY_V1", 32)
+pub fn derive_session_key(
+    salt: &[u8; 4],
+    client_nonce: &[u8; 32],
+    server_nonce: &[u8; 32],
+) -> [u8; 32] {
+    let mut ikm = [0u8; 64];
+    let mut w = ByteWriter::new(&mut ikm);
+    let _ = w.write_bytes(client_nonce);
+    let _ = w.write_bytes(server_nonce);
+
+    let prk = hkdf_extract(salt, &ikm);
+    let mut key = [0u8; 32];
+    let _ = hkdf_expand(&prk, SESSION_KEY_INFO, &mut key);
+    key
+}
+
+/// Generate a pseudo-random client nonce derived from PSK + device UUID + monotonic timestamp:
+/// SHA-256(PSK || UUID || timestamp_ms)
+pub fn generate_client_nonce(
+    psk: &[u8; 32],
+    device_uuid: &[u8; 16],
+    timestamp_ms: u64,
+) -> [u8; 32] {
+    let mut prk_input = [0u8; 64];
+    let mut w = ByteWriter::new(&mut prk_input);
+    let _ = w.write_bytes(psk);
+    let _ = w.write_bytes(device_uuid);
+    let _ = w.write_u64_le(timestamp_ms);
+    sha256(&prk_input)
 }
 
 // ===========================================================================
@@ -391,22 +556,21 @@ pub fn decrypt_and_unpack<'a>(
         return Err(PacketError::BufferTooShort);
     }
 
-    let mut header_bytes = [0u8; HEADER_LEN];
-    header_bytes.copy_from_slice(&frame_buf[..HEADER_LEN]);
-    let header = FrameHeader::decode(&header_bytes)?;
+    let (header_slice, rest) = frame_buf.split_at_mut(HEADER_LEN);
+    let header = FrameHeader::decode(header_slice)?;
 
-    let expected_total = HEADER_LEN + (header.payload_len as usize);
-    if frame_buf.len() < expected_total || (header.payload_len as usize) < TAG_LEN {
+    let expected_payload_len = header.payload_len as usize;
+    if rest.len() < expected_payload_len || expected_payload_len < TAG_LEN {
         return Err(PacketError::BufferTooShort);
     }
 
     let nonce = header.derive_nonce(salt);
-    let ct_and_tag = &mut frame_buf[HEADER_LEN..expected_total];
+    let ct_and_tag = &mut rest[..expected_payload_len];
 
-    let pt_len = chacha20_poly1305_decrypt(key, &nonce, &header_bytes, ct_and_tag)
+    let pt_len = chacha20_poly1305_decrypt(key, &nonce, header_slice, ct_and_tag)
         .map_err(|_| PacketError::DecryptionFailed)?;
 
-    Ok((header, &frame_buf[HEADER_LEN..HEADER_LEN + pt_len]))
+    Ok((header, &rest[..pt_len]))
 }
 
 #[cfg(test)]
@@ -492,5 +656,113 @@ mod tests {
             decrypt_and_unpack(&key, &salt, &mut frame_buf[..total_len]),
             Err(PacketError::DecryptionFailed)
         );
+    }
+
+    #[test]
+    fn test_byte_writer_reader_round_trip() {
+        let mut buf = [0u8; 32];
+        let written_len = {
+            let mut w = ByteWriter::new(&mut buf);
+            assert_eq!(w.offset(), 0);
+            assert_eq!(w.remaining(), 32);
+
+            w.write_u8(0xAA).unwrap();
+            w.write_i8(-42).unwrap();
+            w.write_u16_le(0xBEEF).unwrap();
+            w.write_u32_le(0x12345678).unwrap();
+            w.write_u64_le(0xDEADBEEFCAFE1234).unwrap();
+            w.write_bytes(b"HELLO").unwrap();
+
+            w.offset()
+        };
+        assert_eq!(written_len, 1 + 1 + 2 + 4 + 8 + 5);
+
+        let mut r = ByteReader::new(&buf[..written_len]);
+        assert_eq!(r.read_u8().unwrap(), 0xAA);
+        assert_eq!(r.read_i8().unwrap(), -42);
+        assert_eq!(r.read_u16_le().unwrap(), 0xBEEF);
+        assert_eq!(r.read_u32_le().unwrap(), 0x12345678);
+        assert_eq!(r.read_u64_le().unwrap(), 0xDEADBEEFCAFE1234);
+        assert_eq!(r.read_slice(5).unwrap(), b"HELLO");
+        assert_eq!(r.remaining(), 0);
+    }
+
+    #[test]
+    fn test_byte_writer_overflow_and_reader_underflow() {
+        let mut buf = [0u8; 3];
+        let mut w = ByteWriter::new(&mut buf);
+        w.write_u16_le(0x1234).unwrap();
+        assert_eq!(w.write_u16_le(0x5678), Err(PacketError::BufferTooShort));
+
+        let mut r = ByteReader::new(&buf[..2]);
+        assert_eq!(r.read_u16_le().unwrap(), 0x1234);
+        assert_eq!(r.read_u8(), Err(PacketError::BufferTooShort));
+    }
+
+    #[test]
+    fn test_payloads_round_trip() {
+        // HandshakeInitPayload
+        let init = HandshakeInitPayload {
+            client_nonce: [0x11u8; 32],
+            device_uuid: [0x22u8; 16],
+        };
+        let mut init_buf = [0u8; HandshakeInitPayload::LEN];
+        init.encode(&mut init_buf).unwrap();
+        assert_eq!(HandshakeInitPayload::decode(&init_buf).unwrap(), init);
+
+        // HandshakeRespPayload
+        let resp = HandshakeRespPayload {
+            server_nonce: [0x33u8; 32],
+            assigned_session_id: 0x99887766,
+            session_salt: [0x12, 0x34, 0x56, 0x78],
+        };
+        let mut resp_buf = [0u8; HandshakeRespPayload::LEN];
+        resp.encode(&mut resp_buf).unwrap();
+        assert_eq!(HandshakeRespPayload::decode(&resp_buf).unwrap(), resp);
+
+        // OperatorAuthPayload
+        let auth = OperatorAuthPayload {
+            card_id: [0x55u8; 16],
+            card_id_len: 12,
+            timestamp_ms: 1728000000000,
+        };
+        let mut auth_buf = [0u8; OperatorAuthPayload::LEN];
+        auth.encode(&mut auth_buf).unwrap();
+        assert_eq!(OperatorAuthPayload::decode(&auth_buf).unwrap(), auth);
+
+        // HeartbeatPayload
+        let hb = HeartbeatPayload {
+            battery_pct: 88,
+            rssi: -65,
+            pending_outbox: 3,
+            uptime_s: 3600,
+        };
+        let mut hb_buf = [0u8; HeartbeatPayload::LEN];
+        hb.encode(&mut hb_buf).unwrap();
+        assert_eq!(HeartbeatPayload::decode(&hb_buf).unwrap(), hb);
+
+        // AckPayload
+        let ack = AckPayload {
+            acked_seq: 42,
+            status: 0,
+        };
+        let mut ack_buf = [0u8; AckPayload::LEN];
+        ack.encode(&mut ack_buf).unwrap();
+        assert_eq!(AckPayload::decode(&ack_buf).unwrap(), ack);
+    }
+
+    #[test]
+    fn test_derive_session_key_and_client_nonce() {
+        let psk = [0x55u8; 32];
+        let uuid = [0x77u8; 16];
+        let nonce = generate_client_nonce(&psk, &uuid, 1000);
+        assert_ne!(nonce, [0u8; 32]);
+
+        let server_nonce = [0x88u8; 32];
+        let salt = [1, 2, 3, 4];
+        let key1 = derive_session_key(&salt, &nonce, &server_nonce);
+        let key2 = derive_session_key(&salt, &nonce, &server_nonce);
+        assert_eq!(key1, key2);
+        assert_ne!(key1, [0u8; 32]);
     }
 }
