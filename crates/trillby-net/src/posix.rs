@@ -88,6 +88,125 @@ mod sys {
         }
     }
 
+    pub fn bind(fd: libc::c_int, addr: &libc::sockaddr_in) -> Result<(), libc::c_int> {
+        unsafe {
+            cvt_int(libc::bind(
+                fd,
+                addr as *const _ as *const libc::sockaddr,
+                core::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            ))?;
+        }
+        Ok(())
+    }
+
+    pub fn listen(fd: libc::c_int, backlog: libc::c_int) -> Result<(), libc::c_int> {
+        unsafe {
+            cvt_int(libc::listen(fd, backlog))?;
+        }
+        Ok(())
+    }
+
+    pub fn accept(fd: libc::c_int) -> Result<libc::c_int, libc::c_int> {
+        unsafe {
+            cvt_int(libc::accept4(
+                fd,
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                libc::SOCK_NONBLOCK,
+            ))
+        }
+    }
+
+    pub fn setsockopt_reuseaddr(fd: libc::c_int) -> Result<(), libc::c_int> {
+        let opt: libc::c_int = 1;
+        unsafe {
+            cvt_int(libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_REUSEADDR,
+                &opt as *const _ as *const libc::c_void,
+                core::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            ))?;
+        }
+        Ok(())
+    }
+
+    pub fn getsockname_port(fd: libc::c_int) -> Result<u16, libc::c_int> {
+        let mut addr = libc::sockaddr_in {
+            sin_family: 0,
+            sin_port: 0,
+            sin_addr: libc::in_addr { s_addr: 0 },
+            sin_zero: [0; 8],
+        };
+        let mut len = core::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+        unsafe {
+            cvt_int(libc::getsockname(
+                fd,
+                &mut addr as *mut _ as *mut libc::sockaddr,
+                &mut len,
+            ))?;
+        }
+        Ok(u16::from_be(addr.sin_port))
+    }
+
+    pub fn fill_random(buf: &mut [u8]) -> Result<(), libc::c_int> {
+        let mut offset = 0;
+        while offset < buf.len() {
+            let ret = unsafe {
+                libc::getrandom(
+                    buf[offset..].as_mut_ptr() as *mut libc::c_void,
+                    buf.len() - offset,
+                    0,
+                )
+            };
+            if ret > 0 {
+                offset += ret as usize;
+            } else {
+                let err = last_errno();
+                if err == libc::EINTR {
+                    continue;
+                }
+                // Fallback: try opening /dev/urandom if getrandom failed (e.g. older kernel or ENOSYS)
+                return fill_random_dev_urandom(&mut buf[offset..]);
+            }
+        }
+        Ok(())
+    }
+
+    fn fill_random_dev_urandom(buf: &mut [u8]) -> Result<(), libc::c_int> {
+        let fd = unsafe {
+            libc::open(
+                b"/dev/urandom\0".as_ptr() as *const libc::c_char,
+                libc::O_RDONLY | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(last_errno());
+        }
+        let mut offset = 0;
+        while offset < buf.len() {
+            let ret = unsafe {
+                libc::read(
+                    fd,
+                    buf[offset..].as_mut_ptr() as *mut libc::c_void,
+                    buf.len() - offset,
+                )
+            };
+            if ret > 0 {
+                offset += ret as usize;
+            } else {
+                let err = last_errno();
+                if err == libc::EINTR {
+                    continue;
+                }
+                unsafe { libc::close(fd); }
+                return Err(err);
+            }
+        }
+        unsafe { libc::close(fd); }
+        Ok(())
+    }
+
     pub fn monotonic_ms() -> u64 {
         let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
         unsafe {
@@ -103,6 +222,11 @@ pub fn monotonic_ms() -> u64 {
     sys::monotonic_ms()
 }
 
+/// Fill `buf` with cryptographically secure random bytes via `getrandom(2)` (or `/dev/urandom` fallback).
+pub fn fill_random(buf: &mut [u8]) -> Result<(), libc::c_int> {
+    sys::fill_random(buf)
+}
+
 pub struct PosixSocket {
     fd: libc::c_int,
 }
@@ -113,12 +237,22 @@ impl PosixSocket {
     }
 
     pub fn new_nonblocking_tcp() -> Result<Self, libc::c_int> {
-        sys::socket(
+        let fd = sys::socket(
             libc::AF_INET,
             libc::SOCK_STREAM | libc::SOCK_NONBLOCK,
             0,
-        )
-        .map(|fd| Self { fd })
+        )?;
+        let opt: libc::c_int = 1;
+        unsafe {
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_NODELAY,
+                &opt as *const _ as *const libc::c_void,
+                core::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+        Ok(Self { fd })
     }
 
     pub fn fd(&self) -> libc::c_int {
@@ -156,6 +290,46 @@ impl PosixSocket {
     /// Non-blocking recv. Returns number of bytes received (0 = disconnected), or Err(errno).
     pub fn recv(&self, buf: &mut [u8]) -> Result<usize, libc::c_int> {
         sys::recv(self.fd, buf, libc::MSG_DONTWAIT)
+    }
+
+    /// Bind to IPv4 and start listening. Returns `(socket, bound_port)`.
+    pub fn bind_and_listen_ipv4(ip: [u8; 4], port: u16, backlog: i32) -> Result<(Self, u16), libc::c_int> {
+        let sock = Self::new_nonblocking_tcp()?;
+        sys::setsockopt_reuseaddr(sock.fd)?;
+        let addr = libc::sockaddr_in {
+            sin_family: libc::AF_INET as libc::sa_family_t,
+            sin_port: port.to_be(),
+            sin_addr: libc::in_addr {
+                s_addr: u32::from_ne_bytes(ip),
+            },
+            sin_zero: [0; 8],
+        };
+        sys::bind(sock.fd, &addr)?;
+        sys::listen(sock.fd, backlog)?;
+        let bound_port = sys::getsockname_port(sock.fd)?;
+        Ok((sock, bound_port))
+    }
+
+    /// Accept a new connection non-blocking. Returns `Ok(Some(sock))` on success,
+    /// `Ok(None)` if would block (`EAGAIN`/`EWOULDBLOCK`), or `Err(errno)`.
+    pub fn accept_nonblocking(&self) -> Result<Option<Self>, libc::c_int> {
+        match sys::accept(self.fd) {
+            Ok(client_fd) => {
+                let opt: libc::c_int = 1;
+                unsafe {
+                    libc::setsockopt(
+                        client_fd,
+                        libc::IPPROTO_TCP,
+                        libc::TCP_NODELAY,
+                        &opt as *const _ as *const libc::c_void,
+                        core::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                    );
+                }
+                Ok(Some(Self { fd: client_fd }))
+            }
+            Err(e) if e == libc::EAGAIN || e == libc::EWOULDBLOCK => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     pub fn close(&mut self) {

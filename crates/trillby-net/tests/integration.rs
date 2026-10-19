@@ -1,159 +1,141 @@
-use std::net::TcpListener;
-use std::io::{Read, Write};
-use trillby_net::crypto::sha256;
-use trillby_net::packet::{
-    decrypt_and_unpack, derive_session_key, pack_and_encrypt, AckPayload, HandshakeInitPayload,
-    HandshakeRespPayload, MsgType, WorkStartPayload, HEADER_LEN, MAX_FRAME_LEN,
+use trillby_net::{
+    AuthInitPayload, AuthRespPayload, ClientState, MsgType, NetClient, NetServer, ServerEvent,
 };
-use trillby_net::{ClientState, NetClient};
 use trillby_core::net_types::NetworkStatus;
+
+fn step_client<const CAP: usize, F>(
+    client: &mut NetClient<CAP>,
+    now_ms: u64,
+    on_data: F,
+) -> Option<NetworkStatus>
+where
+    F: FnMut(MsgType, &[u8]),
+{
+    let fd = client.socket_fd();
+    let revents = if fd >= 0 {
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN | libc::POLLOUT,
+            revents: 0,
+        };
+        let ret = unsafe { libc::poll(&mut pfd, 1, 10) };
+        if ret > 0 { pfd.revents } else { 0 }
+    } else {
+        0
+    };
+    client.poll_step_with(now_ms, revents, on_data)
+}
 
 #[test]
 fn test_end_to_end_handshake_and_work_event_flow() {
     let psk = [0x42u8; 32];
     let device_uuid = [0xAAu8; 16];
 
-    // Bind server listener on loopback
-    let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind test listener");
-    let port = listener.local_addr().unwrap().port();
-    listener.set_nonblocking(true).unwrap();
+    let mut server = NetServer::<4>::bind([127, 0, 0, 1], 0).expect("bind NetServer");
+    let port = server.port();
+    let mut client = NetClient::<16>::new(psk, device_uuid, [127, 0, 0, 1], port);
 
-    let mut client: NetClient<16> = NetClient::new(psk, device_uuid, [127, 0, 0, 1], port);
+    let mut now_ms = 1000u64;
 
-    // Step 1: Initial state is Offline
+    // 1. Initial state is Offline
     assert_eq!(client.status(), NetworkStatus::Offline);
 
-    // Step 2: Trigger initial connection at t = 0ms
-    let _ = client.poll_step(0, 0);
-    assert_eq!(client.state(), ClientState::Connecting);
+    // 2. Drive handshake across loopback
+    let psk_resolver = |uuid: &[u8; 16]| if *uuid == device_uuid { Some(psk) } else { None };
 
-    // Accept incoming connection on server side
-    let mut server_stream = loop {
-        match listener.accept() {
-            Ok((stream, _)) => break stream,
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-            Err(e) => panic!("Accept error: {:?}", e),
-        }
-    };
-    server_stream.set_nonblocking(false).unwrap();
+    for _ in 0..5 {
+        now_ms += 10;
+        step_client(&mut client, now_ms, |_, _| {});
+        server.step(now_ms, psk_resolver, |_| {});
+    }
 
-    // Step 3: Client notices socket is connected (POLLOUT) at t = 50ms
-    let status_change = client.poll_step(50, libc::POLLOUT);
-    assert_eq!(client.state(), ClientState::Handshaking);
-    assert_eq!(status_change, Some(NetworkStatus::Handshaking));
+    assert_eq!(client.status(), NetworkStatus::Online);
+    assert_eq!(server.active_client_count(), 1);
+    assert!(server.is_client_online(0));
 
-    // Step 4: Server reads HandshakeInit
-    let mut init_buf = [0u8; MAX_FRAME_LEN];
-    let n = server_stream.read(&mut init_buf).expect("Server read failed");
-    assert!(n >= HEADER_LEN);
-
-    let (init_hdr, init_pt) = decrypt_and_unpack(&psk, &[0u8; 4], &mut init_buf[..n])
-        .expect("Server failed to decrypt HandshakeInit");
-    assert_eq!(init_hdr.msg_type, MsgType::HandshakeInit);
-
-    let init_payload = HandshakeInitPayload::decode(init_pt).unwrap();
-    assert_eq!(init_payload.device_uuid, device_uuid);
-
-    // Step 5: Server prepares HandshakeResp
-    let server_nonce = sha256(b"SERVER_ENTROPY_NONCE_991");
-    let session_id = 999123u32;
-    let session_salt = [0x55, 0x66, 0x77, 0x88];
-
-    let resp_payload = HandshakeRespPayload {
-        server_nonce,
-        assigned_session_id: session_id,
-        session_salt,
-    };
-    let mut resp_pt = [0u8; HandshakeRespPayload::LEN];
-    resp_payload.encode(&mut resp_pt).unwrap();
-
-    let mut resp_frame = [0u8; MAX_FRAME_LEN];
-    let resp_len = pack_and_encrypt(
-        &psk,
-        &[0u8; 4],
-        MsgType::HandshakeResp,
-        0,
-        0,
-        &resp_pt,
-        &mut resp_frame,
-    ).unwrap();
-
-    server_stream.write_all(&resp_frame[..resp_len]).unwrap();
-
-    // Step 6: Client processes HandshakeResp (POLLIN) at t = 100ms
-    let status_change = client.poll_step(100, libc::POLLIN);
-    assert_eq!(client.state(), ClientState::Online);
-    assert_eq!(status_change, Some(NetworkStatus::Online));
-
-    // Server derives the exact same session key
-    let server_session_key = derive_session_key(
-        &session_salt,
-        &init_payload.client_nonce,
-        &server_nonce,
-    );
-
-    // Step 7: Client enqueues WorkStart event
-    let mut wo_id = [0u8; 32];
-    wo_id[..8].copy_from_slice(b"WO-55102");
-    let mut op_id = [0u8; 16];
-    op_id[..7].copy_from_slice(b"OP-0042");
-
-    let work_start = WorkStartPayload {
-        work_order_len: 8,
-        work_order_id: wo_id,
-        operator_id_len: 7,
-        operator_id: op_id,
-        timestamp_ms: 1728800000,
-    };
-    let mut work_pt = [0u8; WorkStartPayload::LEN];
-    work_start.encode(&mut work_pt).unwrap();
-
-    client.enqueue_event(MsgType::WorkStart, &work_pt).unwrap();
+    // 3. Client sends application domain event
+    let app_event = b"WORK_START:WO-55102:OP-0042";
+    client.send_data(app_event).unwrap();
     assert_eq!(client.outbox_pending_count(), 1);
 
-    // Step 8: Client flushes outbox during poll step at t = 150ms
-    let _ = client.poll_step(150, libc::POLLOUT);
+    // 4. Client flushes frame; Server receives and auto-ACKs
+    now_ms += 10;
+    step_client(&mut client, now_ms, |_, _| {});
 
-    // Step 9: Server receives and decrypts WorkStart frame
-    let mut work_buf = [0u8; MAX_FRAME_LEN];
-    let n = server_stream.read(&mut work_buf).unwrap();
-    let (work_hdr, work_decrypted) = decrypt_and_unpack(
-        &server_session_key,
-        &session_salt,
-        &mut work_buf[..n],
-    ).expect("Server failed to decrypt WorkStart frame");
+    let mut received_event = [0u8; 64];
+    let mut received_len = 0;
+    server.step(now_ms, psk_resolver, |event| {
+        if let ServerEvent::Data { client_idx, msg_type, payload } = event {
+            assert_eq!(client_idx, 0);
+            assert_eq!(msg_type, MsgType::Data);
+            received_event[..payload.len()].copy_from_slice(payload);
+            received_len = payload.len();
+        }
+    });
+    assert_eq!(&received_event[..received_len], app_event);
 
-    assert_eq!(work_hdr.msg_type, MsgType::WorkStart);
-    assert_eq!(work_hdr.seq_num, 1);
-    let received_payload = WorkStartPayload::decode(work_decrypted).unwrap();
-    assert_eq!(received_payload, work_start);
+    // 5. Client receives auto-ACK -> outbox is drained
+    now_ms += 10;
+    step_client(&mut client, now_ms, |_, _| {});
+    assert_eq!(client.outbox_pending_count(), 0);
 
-    // Step 10: Server sends Ack
-    let ack_payload = AckPayload {
-        acked_seq: work_hdr.seq_num,
-        status: 0,
+    // 6. Server pushes an application command down to client
+    let server_cmd = b"JOB_DISPATCH:WO-99120";
+    server.send_data(0, server_cmd).unwrap();
+
+    let mut client_received = [0u8; 64];
+    let mut client_received_len = 0;
+    now_ms += 10;
+    step_client(&mut client, now_ms, |msg_type, data| {
+        assert_eq!(msg_type, MsgType::Data);
+        client_received[..data.len()].copy_from_slice(data);
+        client_received_len = data.len();
+    });
+    assert_eq!(&client_received[..client_received_len], server_cmd);
+
+    // 7. Client sends AuthInit (RFID/Operator scan)
+    let auth_req = AuthInitPayload {
+        auth_data_len: 8,
+        auth_data: [1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        timestamp_ms: now_ms,
     };
-    let mut ack_pt = [0u8; AckPayload::LEN];
-    ack_payload.encode(&mut ack_pt).unwrap();
+    client.send_auth(&auth_req).unwrap();
+    assert_eq!(client.outbox_pending_count(), 1);
 
-    let mut ack_frame = [0u8; MAX_FRAME_LEN];
-    let ack_len = pack_and_encrypt(
-        &server_session_key,
-        &session_salt,
-        MsgType::Ack,
-        session_id,
-        100, // server seq
-        &ack_pt,
-        &mut ack_frame,
-    ).unwrap();
-    server_stream.write_all(&ack_frame[..ack_len]).unwrap();
+    now_ms += 10;
+    step_client(&mut client, now_ms, |_, _| {});
 
-    // Step 11: Client receives Ack at t = 200ms
-    let _ = client.poll_step(200, libc::POLLIN);
+    let mut auth_received = false;
+    server.step(now_ms, psk_resolver, |event| {
+        if let ServerEvent::Data { msg_type: MsgType::AuthInit, payload, .. } = event {
+            let decoded = AuthInitPayload::decode(payload).unwrap();
+            assert_eq!(decoded.auth_data_len, 8);
+            assert_eq!(&decoded.auth_data[..8], &[1, 2, 3, 4, 5, 6, 7, 8]);
+            auth_received = true;
+        }
+    });
+    assert!(auth_received);
 
-    // Outbox should now be completely drained
+    // 8. Server responds with AuthResp
+    let auth_resp = AuthRespPayload {
+        status: 0, // Authorized
+        role: 1,   // Operator role
+        session_ttl_s: 3600,
+    };
+    server.send_auth_resp(0, &auth_resp).unwrap();
+
+    now_ms += 10;
+    let mut client_auth_resp = false;
+    step_client(&mut client, now_ms, |msg_type, data| {
+        if msg_type == MsgType::AuthResp {
+            let resp = AuthRespPayload::decode(data).unwrap();
+            assert_eq!(resp.status, 0);
+            assert_eq!(resp.role, 1);
+            assert_eq!(resp.session_ttl_s, 3600);
+            client_auth_resp = true;
+        }
+    });
+    assert!(client_auth_resp);
     assert_eq!(client.outbox_pending_count(), 0);
     assert_eq!(client.status(), NetworkStatus::Online);
 }

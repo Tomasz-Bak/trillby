@@ -159,19 +159,26 @@ fn run_app() {
     }
     fb_writer.write_frame(&buffer);
 
-    // Provisioned device credentials
-    let psk = [0x42u8; 32];
-    let device_uuid = [
-        0x54, 0x52, 0x49, 0x4C, 0x4C, 0x42, 0x59, 0x5F,
-        0x30, 0x30, 0x30, 0x31, 0x00, 0x00, 0x00, 0x00,
-    ];
-    let server_ip = [127, 0, 0, 1];
-    let server_port = 8088;
+    // Load provisioned device credentials from /etc/trillby/device.key (with fallback for dev/sim)
+    let provisioning = trillby_net::DeviceProvisioning::load_from_file("/etc/trillby/device.key")
+        .unwrap_or_else(|_| {
+            raw_print("NOTICE: /etc/trillby/device.key not found; using fallback dev credentials\n");
+            trillby_net::DeviceProvisioning {
+                psk: [0x42u8; 32],
+                device_uuid: [
+                    0x54, 0x52, 0x49, 0x4C, 0x4C, 0x42, 0x59, 0x5F,
+                    0x30, 0x30, 0x30, 0x31, 0x00, 0x00, 0x00, 0x00,
+                ],
+                server_ip: [127, 0, 0, 1],
+                server_port: 8088,
+            }
+        });
+
     let mut net_client: trillby_net::NetClient<32> = trillby_net::NetClient::new(
-        psk,
-        device_uuid,
-        server_ip,
-        server_port,
+        provisioning.psk,
+        provisioning.device_uuid,
+        provisioning.server_ip,
+        provisioning.server_port,
     );
 
     #[cfg(feature = "qemu-sim")]
@@ -272,30 +279,18 @@ fn run_app() {
                                             if let Some(rest) = trimmed.strip_prefix("rfid ") {
                                                 if let Ok(id) = heapless::String::try_from(rest) {
                                                     state.handle_event(UiEvent::RfidScanned(id.clone()), core_bounds, core_kb_bounds, None);
-                                                    let mut payload = trillby_net::OperatorAuthPayload {
-                                                        card_id: [0u8; 16],
-                                                        card_id_len: id.len().min(16) as u8,
+                                                    let mut payload = trillby_net::AuthInitPayload {
+                                                        auth_data_len: id.len().min(32) as u8,
+                                                        auth_data: [0u8; 32],
                                                         timestamp_ms: now_ms,
                                                     };
-                                                    payload.card_id[..id.len().min(16)].copy_from_slice(id.as_bytes());
-                                                    let mut pt_buf = [0u8; trillby_net::OperatorAuthPayload::LEN];
-                                                    let _ = payload.encode(&mut pt_buf);
-                                                    let _ = net_client.enqueue_event(trillby_net::MsgType::OperatorAuth, &pt_buf);
+                                                    payload.auth_data[..id.len().min(32)].copy_from_slice(id.as_bytes());
+                                                    let _ = net_client.send_auth(&payload);
                                                 }
                                             } else if let Some(rest) = trimmed.strip_prefix("barcode ") {
                                                 if let Ok(data) = heapless::String::try_from(rest) {
                                                     state.handle_event(UiEvent::BarcodeScanned(data.clone()), core_bounds, core_kb_bounds, None);
-                                                    let mut payload = trillby_net::WorkStartPayload {
-                                                        work_order_len: data.len().min(32) as u8,
-                                                        work_order_id: [0u8; 32],
-                                                        operator_id_len: 0,
-                                                        operator_id: [0u8; 16],
-                                                        timestamp_ms: now_ms,
-                                                    };
-                                                    payload.work_order_id[..data.len().min(32)].copy_from_slice(data.as_bytes());
-                                                    let mut pt_buf = [0u8; trillby_net::WorkStartPayload::LEN];
-                                                    let _ = payload.encode(&mut pt_buf);
-                                                    let _ = net_client.enqueue_event(trillby_net::MsgType::WorkStart, &pt_buf);
+                                                    let _ = net_client.send_data(data.as_bytes());
                                                 }
                                             } else if let Some(rest) = trimmed.strip_prefix("type ") {
                                                 if let Ok(data) = heapless::String::try_from(rest) {
@@ -409,9 +404,7 @@ fn run_app() {
                 pending_outbox: net_client.outbox_pending_count() as u16,
                 uptime_s: (now_ms / 1000) as u32,
             };
-            let mut pt_buf = [0u8; trillby_net::HeartbeatPayload::LEN];
-            let _ = hb.encode(&mut pt_buf);
-            let _ = net_client.enqueue_event(trillby_net::MsgType::Heartbeat, &pt_buf);
+            let _ = net_client.send_heartbeat(&hb);
         }
 
         // Repaint framebuffer only when state is marked dirty

@@ -5,14 +5,15 @@
 //! for ChaCha20-Poly1305.
 
 use crate::crypto::{
-    chacha20_poly1305_decrypt, chacha20_poly1305_encrypt,
-    hkdf_expand, hkdf_extract, sha256,
+    chacha20_poly1305_decrypt, chacha20_poly1305_encrypt, constant_time_eq,
+    hkdf_expand, hkdf_extract, hmac_sha256, sha256,
 };
 
 pub const FRAME_MAGIC: [u8; 2] = [0x54, 0x52]; // "TR"
 pub const PROTOCOL_VERSION: u8 = 0x01;
 pub const HEADER_LEN: usize = 16;
 pub const TAG_LEN: usize = 16;
+pub const HMAC_TAG_LEN: usize = 32;
 pub const MAX_PAYLOAD_LEN: u16 = 240;
 pub const MAX_FRAME_LEN: usize = HEADER_LEN + (MAX_PAYLOAD_LEN as usize); // 256 bytes
 
@@ -24,6 +25,7 @@ pub enum PacketError {
     BufferTooShort,
     PayloadTooLarge,
     DecryptionFailed,
+    AuthenticationFailed,
     InvalidPayload,
 }
 
@@ -32,15 +34,12 @@ pub enum PacketError {
 pub enum MsgType {
     HandshakeInit = 0x01,
     HandshakeResp = 0x02,
-    OperatorAuth = 0x10,
-    WorkStart = 0x11,
-    WorkPause = 0x12,
-    WorkResume = 0x13,
-    WorkFinish = 0x14,
-    QaNote = 0x15,
-    Heartbeat = 0x20,
-    Ack = 0x30,
-    Rekey = 0x40,
+    Rekey         = 0x03,
+    Heartbeat     = 0x10,
+    Ack           = 0x11,
+    AuthInit      = 0x20,
+    AuthResp      = 0x21,
+    Data          = 0x30,
 }
 
 impl TryFrom<u8> for MsgType {
@@ -50,15 +49,12 @@ impl TryFrom<u8> for MsgType {
         match val {
             0x01 => Ok(MsgType::HandshakeInit),
             0x02 => Ok(MsgType::HandshakeResp),
-            0x10 => Ok(MsgType::OperatorAuth),
-            0x11 => Ok(MsgType::WorkStart),
-            0x12 => Ok(MsgType::WorkPause),
-            0x13 => Ok(MsgType::WorkResume),
-            0x14 => Ok(MsgType::WorkFinish),
-            0x15 => Ok(MsgType::QaNote),
-            0x20 => Ok(MsgType::Heartbeat),
-            0x30 => Ok(MsgType::Ack),
-            0x40 => Ok(MsgType::Rekey),
+            0x03 => Ok(MsgType::Rekey),
+            0x10 => Ok(MsgType::Heartbeat),
+            0x11 => Ok(MsgType::Ack),
+            0x20 => Ok(MsgType::AuthInit),
+            0x21 => Ok(MsgType::AuthResp),
+            0x30 => Ok(MsgType::Data),
             _ => Err(PacketError::UnknownMsgType),
         }
     }
@@ -344,67 +340,63 @@ impl HandshakeRespPayload {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct OperatorAuthPayload {
-    pub card_id: [u8; 16],
-    pub card_id_len: u8,
+pub struct AuthInitPayload {
+    pub auth_data_len: u8,
+    pub auth_data: [u8; 32],
     pub timestamp_ms: u64,
 }
 
-impl OperatorAuthPayload {
-    pub const LEN: usize = 25; // 1 + 16 + 8
+impl AuthInitPayload {
+    pub const LEN: usize = 41; // 1 + 32 + 8
 
     pub fn encode(&self, out: &mut [u8]) -> Result<(), PacketError> {
         let mut w = ByteWriter::new(out);
-        w.write_u8(self.card_id_len)?;
-        w.write_bytes(&self.card_id)?;
+        w.write_u8(self.auth_data_len)?;
+        w.write_bytes(&self.auth_data)?;
         w.write_u64_le(self.timestamp_ms)?;
         Ok(())
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, PacketError> {
         let mut r = ByteReader::new(bytes);
-        let card_id_len = r.read_u8()?;
-        let card_id = r.read_array::<16>()?;
+        let auth_data_len = r.read_u8()?;
+        let auth_data = r.read_array::<32>()?;
         let timestamp_ms = r.read_u64_le()?;
-        Ok(Self { card_id, card_id_len, timestamp_ms })
+        Ok(Self {
+            auth_data_len,
+            auth_data,
+            timestamp_ms,
+        })
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WorkStartPayload {
-    pub work_order_len: u8,
-    pub work_order_id: [u8; 32],
-    pub operator_id_len: u8,
-    pub operator_id: [u8; 16],
-    pub timestamp_ms: u64,
+pub struct AuthRespPayload {
+    pub status: u8,
+    pub role: u8,
+    pub session_ttl_s: u32,
 }
 
-impl WorkStartPayload {
-    pub const LEN: usize = 58; // 1 + 32 + 1 + 16 + 8
+impl AuthRespPayload {
+    pub const LEN: usize = 6; // 1 + 1 + 4
 
     pub fn encode(&self, out: &mut [u8]) -> Result<(), PacketError> {
         let mut w = ByteWriter::new(out);
-        w.write_u8(self.work_order_len)?;
-        w.write_bytes(&self.work_order_id)?;
-        w.write_u8(self.operator_id_len)?;
-        w.write_bytes(&self.operator_id)?;
-        w.write_u64_le(self.timestamp_ms)?;
+        w.write_u8(self.status)?;
+        w.write_u8(self.role)?;
+        w.write_u32_le(self.session_ttl_s)?;
         Ok(())
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, PacketError> {
         let mut r = ByteReader::new(bytes);
-        let work_order_len = r.read_u8()?;
-        let work_order_id = r.read_array::<32>()?;
-        let operator_id_len = r.read_u8()?;
-        let operator_id = r.read_array::<16>()?;
-        let timestamp_ms = r.read_u64_le()?;
+        let status = r.read_u8()?;
+        let role = r.read_u8()?;
+        let session_ttl_s = r.read_u32_le()?;
         Ok(Self {
-            work_order_len,
-            work_order_id,
-            operator_id_len,
-            operator_id,
-            timestamp_ms,
+            status,
+            role,
+            session_ttl_s,
         })
     }
 }
@@ -474,23 +466,82 @@ impl AckPayload {
 
 pub const SESSION_KEY_INFO: &[u8] = b"TRILLBY_SESSION_KEY_V1";
 
-/// Derive the symmetric session key using HKDF-SHA256:
-/// PRK = HKDF-Extract(salt, client_nonce || server_nonce)
+/// Derive the symmetric session key using HKDF-SHA256 (RFC 5869):
+/// PRK = HKDF-Extract(salt = client_nonce || server_nonce || session_salt, IKM = psk)
 /// Key = HKDF-Expand(PRK, "TRILLBY_SESSION_KEY_V1", 32)
 pub fn derive_session_key(
+    psk: &[u8; 32],
     salt: &[u8; 4],
     client_nonce: &[u8; 32],
     server_nonce: &[u8; 32],
 ) -> [u8; 32] {
-    let mut ikm = [0u8; 64];
-    let mut w = ByteWriter::new(&mut ikm);
+    let mut nonce_salt = [0u8; 68];
+    let mut w = ByteWriter::new(&mut nonce_salt);
     let _ = w.write_bytes(client_nonce);
     let _ = w.write_bytes(server_nonce);
+    let _ = w.write_bytes(salt);
 
-    let prk = hkdf_extract(salt, &ikm);
+    let prk = hkdf_extract(&nonce_salt, psk);
     let mut key = [0u8; 32];
     let _ = hkdf_expand(&prk, SESSION_KEY_INFO, &mut key);
     key
+}
+
+/// Assemble and HMAC-authenticate an unencrypted handshake frame.
+/// Returns total frame length (16-byte header + payload + 32-byte HMAC-SHA256 tag).
+pub fn pack_and_authenticate_hmac(
+    key: &[u8; 32],
+    msg_type: MsgType,
+    session_id: u32,
+    seq_num: u32,
+    payload: &[u8],
+    frame_buf: &mut [u8],
+) -> Result<usize, PacketError> {
+    let payload_len = payload.len() + HMAC_TAG_LEN;
+    let total_len = HEADER_LEN + payload_len;
+    if total_len > frame_buf.len() || payload_len > (MAX_PAYLOAD_LEN as usize) {
+        return Err(PacketError::PayloadTooLarge);
+    }
+
+    let header = FrameHeader::new(msg_type, session_id, seq_num, payload_len as u16);
+    let mut header_bytes = [0u8; HEADER_LEN];
+    header.encode(&mut header_bytes);
+
+    frame_buf[..HEADER_LEN].copy_from_slice(&header_bytes);
+    frame_buf[HEADER_LEN..HEADER_LEN + payload.len()].copy_from_slice(payload);
+
+    let tag = hmac_sha256(key, &frame_buf[..HEADER_LEN + payload.len()]);
+    frame_buf[HEADER_LEN + payload.len()..total_len].copy_from_slice(&tag);
+
+    Ok(total_len)
+}
+
+/// Verify HMAC-SHA256 authentication and unpack an unencrypted handshake frame.
+/// Returns (FrameHeader, payload_slice).
+pub fn verify_and_unpack_hmac<'a>(
+    key: &[u8; 32],
+    frame_buf: &'a [u8],
+) -> Result<(FrameHeader, &'a [u8]), PacketError> {
+    if frame_buf.len() < HEADER_LEN + HMAC_TAG_LEN {
+        return Err(PacketError::BufferTooShort);
+    }
+
+    let header = FrameHeader::decode(&frame_buf[..HEADER_LEN])?;
+    let expected_payload_len = header.payload_len as usize;
+    if frame_buf.len() < HEADER_LEN + expected_payload_len || expected_payload_len < HMAC_TAG_LEN {
+        return Err(PacketError::BufferTooShort);
+    }
+
+    let data_len = expected_payload_len - HMAC_TAG_LEN;
+    let authenticated_len = HEADER_LEN + data_len;
+    let expected_tag = hmac_sha256(key, &frame_buf[..authenticated_len]);
+    let received_tag = &frame_buf[authenticated_len..HEADER_LEN + expected_payload_len];
+
+    if !constant_time_eq(&expected_tag, received_tag) {
+        return Err(PacketError::AuthenticationFailed);
+    }
+
+    Ok((header, &frame_buf[HEADER_LEN..authenticated_len]))
 }
 
 /// Generate a pseudo-random client nonce derived from PSK + device UUID + monotonic timestamp:
@@ -579,7 +630,7 @@ mod tests {
 
     #[test]
     fn test_header_encode_decode() {
-        let hdr = FrameHeader::new(MsgType::WorkStart, 0x12345678, 42, 64);
+        let hdr = FrameHeader::new(MsgType::Data, 0x12345678, 42, 64);
         let mut bytes = [0u8; HEADER_LEN];
         hdr.encode(&mut bytes);
         let decoded = FrameHeader::decode(&bytes).unwrap();
@@ -592,33 +643,19 @@ mod tests {
         let salt = [0x11, 0x22, 0x33, 0x44];
         let mut frame_buf = [0u8; 256];
 
-        let mut work_order = [0u8; 32];
-        work_order[..9].copy_from_slice(b"WO_9921_Q");
-        let mut operator = [0u8; 16];
-        operator[..7].copy_from_slice(b"OP_7741");
-
-        let payload = WorkStartPayload {
-            work_order_len: 9,
-            work_order_id: work_order,
-            operator_id_len: 7,
-            operator_id: operator,
-            timestamp_ms: 1728750000000,
-        };
-
-        let mut pt_buf = [0u8; 64];
-        payload.encode(&mut pt_buf).unwrap();
+        let plaintext = b"APPLICATION_LEVEL_PAYLOAD_BYTES";
 
         let total_frame_len = pack_and_encrypt(
             &key,
             &salt,
-            MsgType::WorkStart,
+            MsgType::Data,
             100,
             1,
-            &pt_buf[..WorkStartPayload::LEN],
+            plaintext,
             &mut frame_buf,
         ).unwrap();
 
-        assert_eq!(total_frame_len, HEADER_LEN + WorkStartPayload::LEN + TAG_LEN);
+        assert_eq!(total_frame_len, HEADER_LEN + plaintext.len() + TAG_LEN);
 
         // Decrypt
         let (hdr, decrypted_pt) = decrypt_and_unpack(
@@ -627,10 +664,9 @@ mod tests {
             &mut frame_buf[..total_frame_len],
         ).unwrap();
 
-        assert_eq!(hdr.msg_type, MsgType::WorkStart);
+        assert_eq!(hdr.msg_type, MsgType::Data);
         assert_eq!(hdr.seq_num, 1);
-        let decoded_payload = WorkStartPayload::decode(decrypted_pt).unwrap();
-        assert_eq!(decoded_payload, payload);
+        assert_eq!(decrypted_pt, plaintext);
     }
 
     #[test]
@@ -643,7 +679,7 @@ mod tests {
         let total_len = pack_and_encrypt(
             &key,
             &salt,
-            MsgType::OperatorAuth,
+            MsgType::AuthInit,
             1,
             1,
             pt,
@@ -720,15 +756,25 @@ mod tests {
         resp.encode(&mut resp_buf).unwrap();
         assert_eq!(HandshakeRespPayload::decode(&resp_buf).unwrap(), resp);
 
-        // OperatorAuthPayload
-        let auth = OperatorAuthPayload {
-            card_id: [0x55u8; 16],
-            card_id_len: 12,
+        // AuthInitPayload
+        let auth_init = AuthInitPayload {
+            auth_data: [0x55u8; 32],
+            auth_data_len: 16,
             timestamp_ms: 1728000000000,
         };
-        let mut auth_buf = [0u8; OperatorAuthPayload::LEN];
-        auth.encode(&mut auth_buf).unwrap();
-        assert_eq!(OperatorAuthPayload::decode(&auth_buf).unwrap(), auth);
+        let mut auth_init_buf = [0u8; AuthInitPayload::LEN];
+        auth_init.encode(&mut auth_init_buf).unwrap();
+        assert_eq!(AuthInitPayload::decode(&auth_init_buf).unwrap(), auth_init);
+
+        // AuthRespPayload
+        let auth_resp = AuthRespPayload {
+            status: 0,
+            role: 2,
+            session_ttl_s: 3600,
+        };
+        let mut auth_resp_buf = [0u8; AuthRespPayload::LEN];
+        auth_resp.encode(&mut auth_resp_buf).unwrap();
+        assert_eq!(AuthRespPayload::decode(&auth_resp_buf).unwrap(), auth_resp);
 
         // HeartbeatPayload
         let hb = HeartbeatPayload {
@@ -760,9 +806,64 @@ mod tests {
 
         let server_nonce = [0x88u8; 32];
         let salt = [1, 2, 3, 4];
-        let key1 = derive_session_key(&salt, &nonce, &server_nonce);
-        let key2 = derive_session_key(&salt, &nonce, &server_nonce);
+        let key1 = derive_session_key(&psk, &salt, &nonce, &server_nonce);
+        let key2 = derive_session_key(&psk, &salt, &nonce, &server_nonce);
         assert_eq!(key1, key2);
         assert_ne!(key1, [0u8; 32]);
+
+        // Different PSK produces completely different session key
+        let diff_psk = [0x56u8; 32];
+        let diff_key = derive_session_key(&diff_psk, &salt, &nonce, &server_nonce);
+        assert_ne!(key1, diff_key);
+    }
+
+    #[test]
+    fn test_hmac_handshake_round_trip_and_tamper() {
+        let key = [0x42u8; 32];
+        let init = HandshakeInitPayload {
+            client_nonce: [0x11u8; 32],
+            device_uuid: [0x22u8; 16],
+        };
+        let mut pt_buf = [0u8; HandshakeInitPayload::LEN];
+        init.encode(&mut pt_buf).unwrap();
+
+        let mut frame_buf = [0u8; MAX_FRAME_LEN];
+        let len = pack_and_authenticate_hmac(
+            &key,
+            MsgType::HandshakeInit,
+            0,
+            0,
+            &pt_buf,
+            &mut frame_buf,
+        ).unwrap();
+
+        let (hdr, payload) = verify_and_unpack_hmac(&key, &frame_buf[..len]).unwrap();
+        assert_eq!(hdr.msg_type, MsgType::HandshakeInit);
+        let decoded = HandshakeInitPayload::decode(payload).unwrap();
+        assert_eq!(decoded, init);
+
+        // Tampering with payload byte fails authentication
+        let mut tampered = frame_buf;
+        tampered[HEADER_LEN] ^= 0x01;
+        assert_eq!(
+            verify_and_unpack_hmac(&key, &tampered[..len]),
+            Err(PacketError::AuthenticationFailed)
+        );
+
+        // Tampering with header byte fails authentication
+        let mut tampered_hdr = frame_buf;
+        tampered_hdr[4] ^= 0x01; // Change session_id field in header
+        assert_eq!(
+            verify_and_unpack_hmac(&key, &tampered_hdr[..len]),
+            Err(PacketError::AuthenticationFailed)
+        );
+
+        // Tampering with HMAC tag fails authentication
+        let mut tampered_tag = frame_buf;
+        tampered_tag[len - 1] ^= 0x01;
+        assert_eq!(
+            verify_and_unpack_hmac(&key, &tampered_tag[..len]),
+            Err(PacketError::AuthenticationFailed)
+        );
     }
 }
