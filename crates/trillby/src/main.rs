@@ -75,7 +75,7 @@ use embedded_graphics::{
 use embedded_graphics_framebuf::FrameBuf;
 use fb::FramebufferWriter;
 use trillby_core::{
-    Point as CorePoint, UiEvent, UiState,
+    Point as CorePoint, UiEvent, UiState, POLL_TIMEOUT_MS,
 };
 use trillby_ui::{
     eg_rect_to_core, KeyboardGrid, LayoutZones, UiRenderer,
@@ -159,9 +159,27 @@ fn run_app() {
     }
     fb_writer.write_frame(&buffer);
 
-    // Prepare non-blocking POSIX poll descriptors
-    let mut pollfds: [libc::pollfd; 12] = unsafe { core::mem::zeroed() };
-    let mut poll_count = 0;
+    // Load provisioned device credentials from /etc/trillby/device.key (with fallback for dev/sim)
+    let provisioning = trillby_net::DeviceProvisioning::load_from_file("/etc/trillby/device.key")
+        .unwrap_or_else(|_| {
+            raw_print("NOTICE: /etc/trillby/device.key not found; using fallback dev credentials\n");
+            trillby_net::DeviceProvisioning {
+                psk: [0x42u8; 32],
+                device_uuid: [
+                    0x54, 0x52, 0x49, 0x4C, 0x4C, 0x42, 0x59, 0x5F,
+                    0x30, 0x30, 0x30, 0x31, 0x00, 0x00, 0x00, 0x00,
+                ],
+                server_ip: [127, 0, 0, 1],
+                server_port: 8088,
+            }
+        });
+
+    let mut net_client: trillby_net::NetClient<32> = trillby_net::NetClient::new(
+        provisioning.psk,
+        provisioning.device_uuid,
+        provisioning.server_ip,
+        provisioning.server_port,
+    );
 
     #[cfg(feature = "qemu-sim")]
     let tty_fd = unsafe {
@@ -169,8 +187,6 @@ fn run_app() {
     };
     #[cfg(feature = "qemu-sim")]
     if tty_fd >= 0 {
-        pollfds[poll_count] = libc::pollfd { fd: tty_fd, events: libc::POLLIN, revents: 0 };
-        poll_count += 1;
         raw_print("Serial stdin listener enabled on /dev/ttyAMA0\n");
     }
 
@@ -188,28 +204,58 @@ fn run_app() {
         if fd >= 0 {
             evdev_fds[evdev_cnt] = fd;
             evdev_cnt += 1;
-            pollfds[poll_count] = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
-            poll_count += 1;
         }
     }
 
     let mut raw_x: i32 = 0;
     let mut raw_y: i32 = 0;
+    let mut is_touch_down = false;
+    let mut touch_moved = false;
+    let mut last_heartbeat_ms: u64 = 0;
 
     #[cfg(feature = "qemu-sim")]
     let mut serial_line_buf = [0u8; 128];
     #[cfg(feature = "qemu-sim")]
     let mut serial_line_len = 0;
 
-    // Single-threaded zero-allocation POSIX poll loop (20Hz / 50ms tick timeout)
+    // Single-threaded zero-allocation POSIX poll loop with centralized timeout
     loop {
-        for i in 0..poll_count {
-            pollfds[i].revents = 0;
+        let mut pollfds: [libc::pollfd; 16] = unsafe { core::mem::zeroed() };
+        let mut poll_count = 0;
+
+        #[cfg(feature = "qemu-sim")]
+        if tty_fd >= 0 {
+            pollfds[poll_count] = libc::pollfd { fd: tty_fd, events: libc::POLLIN, revents: 0 };
+            poll_count += 1;
         }
 
-        let ret = unsafe { libc::poll(pollfds.as_mut_ptr(), poll_count as libc::nfds_t, 50) };
+        for i in 0..evdev_cnt {
+            pollfds[poll_count] = libc::pollfd { fd: evdev_fds[i], events: libc::POLLIN, revents: 0 };
+            poll_count += 1;
+        }
+
+        let net_fd = net_client.socket_fd();
+        let mut net_poll_idx: i32 = -1;
+        if net_fd >= 0 {
+            let mut events = libc::POLLIN;
+            if net_client.state() == trillby_net::ClientState::Connecting || net_client.outbox_pending_count() > 0 {
+                events |= libc::POLLOUT;
+            }
+            net_poll_idx = poll_count as i32;
+            pollfds[poll_count] = libc::pollfd { fd: net_fd, events, revents: 0 };
+            poll_count += 1;
+        }
+
+        let ret = unsafe { libc::poll(pollfds.as_mut_ptr(), poll_count as libc::nfds_t, POLL_TIMEOUT_MS) };
+        let now_ms = trillby_net::monotonic_ms();
         let zones = LayoutZones::compute(screen_bounds, state.keyboard_visible);
         let core_kb_bounds = zones.keyboard_area.map(eg_rect_to_core);
+
+        let net_revents = if net_poll_idx >= 0 {
+            pollfds[net_poll_idx as usize].revents
+        } else {
+            0
+        };
 
         if ret == 0 {
             // 50ms Timeout -> send 20Hz Tick event
@@ -232,11 +278,19 @@ fn run_app() {
                                             let trimmed = line.trim();
                                             if let Some(rest) = trimmed.strip_prefix("rfid ") {
                                                 if let Ok(id) = heapless::String::try_from(rest) {
-                                                    state.handle_event(UiEvent::RfidScanned(id), core_bounds, core_kb_bounds, None);
+                                                    state.handle_event(UiEvent::RfidScanned(id.clone()), core_bounds, core_kb_bounds, None);
+                                                    let mut payload = trillby_net::AuthInitPayload {
+                                                        auth_data_len: id.len().min(32) as u8,
+                                                        auth_data: [0u8; 32],
+                                                        timestamp_ms: now_ms,
+                                                    };
+                                                    payload.auth_data[..id.len().min(32)].copy_from_slice(id.as_bytes());
+                                                    let _ = net_client.send_auth(&payload);
                                                 }
                                             } else if let Some(rest) = trimmed.strip_prefix("barcode ") {
                                                 if let Ok(data) = heapless::String::try_from(rest) {
-                                                    state.handle_event(UiEvent::BarcodeScanned(data), core_bounds, core_kb_bounds, None);
+                                                    state.handle_event(UiEvent::BarcodeScanned(data.clone()), core_bounds, core_kb_bounds, None);
+                                                    let _ = net_client.send_data(data.as_bytes());
                                                 }
                                             } else if let Some(rest) = trimmed.strip_prefix("type ") {
                                                 if let Ok(data) = heapless::String::try_from(rest) {
@@ -268,47 +322,53 @@ fn run_app() {
                     }
 
                     // Read evdev InputEvents
-                    let mut events = [InputEvent::default(); 8];
-                    let n = unsafe {
-                        libc::read(
-                            pfd.fd,
-                            events.as_mut_ptr() as *mut _,
-                            events.len() * core::mem::size_of::<InputEvent>(),
-                        )
-                    };
-                    if n > 0 {
+                    loop {
+                        let mut events = [InputEvent::default(); 64];
+                        let n = unsafe {
+                            libc::read(
+                                pfd.fd,
+                                events.as_mut_ptr() as *mut _,
+                                events.len() * core::mem::size_of::<InputEvent>(),
+                            )
+                        };
+                        if n <= 0 {
+                            break;
+                        }
                         let ev_count = n as usize / core::mem::size_of::<InputEvent>();
                         for ev in &events[..ev_count] {
                             match ev.type_ {
                                 3 => { // EV_ABS
                                     if ev.code == 0 || ev.code == 53 {
                                         raw_x = ev.value;
+                                        touch_moved = true;
                                     } else if ev.code == 1 || ev.code == 54 {
                                         raw_y = ev.value;
+                                        touch_moved = true;
                                     }
-                                    let eg_pt = scale_touch_point(raw_x, raw_y);
-                                    let core_pt = CorePoint::new(eg_pt.x, eg_pt.y);
-                                    state.handle_event(UiEvent::TouchMove { scaled: core_pt, raw: (raw_x, raw_y) }, core_bounds, core_kb_bounds, None);
                                 }
                                 2 => { // EV_REL
                                     if ev.code == 0 {
                                         raw_x = (raw_x + ev.value * 10).clamp(0, 32767);
+                                        touch_moved = true;
                                     } else if ev.code == 1 {
                                         raw_y = (raw_y + ev.value * 10).clamp(0, 32767);
+                                        touch_moved = true;
                                     }
-                                    let eg_pt = scale_touch_point(raw_x, raw_y);
-                                    let core_pt = CorePoint::new(eg_pt.x, eg_pt.y);
-                                    state.handle_event(UiEvent::TouchMove { scaled: core_pt, raw: (raw_x, raw_y) }, core_bounds, core_kb_bounds, None);
                                 }
                                 1 => { // EV_KEY
                                     if ev.code == 330 || ev.code == 272 { // BTN_TOUCH or BTN_LEFT
                                         let eg_pt = scale_touch_point(raw_x, raw_y);
                                         let core_pt = CorePoint::new(eg_pt.x, eg_pt.y);
                                         if ev.value == 1 {
+                                            is_touch_down = true;
+                                            touch_moved = false;
                                             let key = zones.keyboard_area.and_then(|kb| KeyboardGrid::resolve_key(kb, eg_pt, state.keyboard_layer));
                                             state.handle_event(UiEvent::TouchDown { scaled: core_pt, raw: (raw_x, raw_y) }, core_bounds, core_kb_bounds, key);
                                         } else if ev.value == 0 {
-                                            state.handle_event(UiEvent::TouchUp { scaled: core_pt, raw: (raw_x, raw_y) }, core_bounds, core_kb_bounds, None);
+                                            is_touch_down = false;
+                                            touch_moved = false;
+                                            let key = zones.keyboard_area.and_then(|kb| KeyboardGrid::resolve_key(kb, eg_pt, state.keyboard_layer));
+                                            state.handle_event(UiEvent::TouchUp { scaled: core_pt, raw: (raw_x, raw_y) }, core_bounds, core_kb_bounds, key);
                                         }
                                     }
                                 }
@@ -318,6 +378,33 @@ fn run_app() {
                     }
                 }
             }
+
+            // After draining all queues, if we moved while down, dispatch one coalesced TouchMove
+            if is_touch_down && touch_moved {
+                let eg_pt = scale_touch_point(raw_x, raw_y);
+                let core_pt = CorePoint::new(eg_pt.x, eg_pt.y);
+                let key = zones.keyboard_area.and_then(|kb| KeyboardGrid::resolve_key(kb, eg_pt, state.keyboard_layer));
+                state.handle_event(UiEvent::TouchMove { scaled: core_pt, raw: (raw_x, raw_y) }, core_bounds, core_kb_bounds, key);
+                touch_moved = false;
+            }
+        }
+
+        // Network step: drive connection state machine and outbox transmission
+        if let Some(new_status) = net_client.poll_step(now_ms, net_revents) {
+            state.handle_event(UiEvent::NetworkStatusChanged(new_status), core_bounds, core_kb_bounds, None);
+        }
+        state.pending_outbox_count = net_client.outbox_pending_count() as u16;
+
+        // Periodic 10-second heartbeat telemetry when online (monotonic timing)
+        if now_ms.saturating_sub(last_heartbeat_ms) >= 10_000 && net_client.state() == trillby_net::ClientState::Online {
+            last_heartbeat_ms = now_ms;
+            let hb = trillby_net::HeartbeatPayload {
+                battery_pct: 100,
+                rssi: -45,
+                pending_outbox: net_client.outbox_pending_count() as u16,
+                uptime_s: (now_ms / 1000) as u32,
+            };
+            let _ = net_client.send_heartbeat(&hb);
         }
 
         // Repaint framebuffer only when state is marked dirty

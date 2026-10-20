@@ -23,7 +23,7 @@ fi
 
 echo "==> Building static AArch64 Trillby binary..."
 CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-unknown-linux-gnu-gcc \
-RUSTFLAGS="-C target-feature=+crt-static" \
+RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-Wl,--start-group -C link-arg=-lc -C link-arg=-lgcc -C link-arg=-Wl,--end-group" \
 RUSTC_BOOTSTRAP=1 \
 cargo build -Z build-std --target aarch64-unknown-linux-gnu --package trillby --features qemu-sim
 
@@ -57,5 +57,7 @@ exec qemu-system-aarch64 \
     -append "console=tty0 console=ttyAMA0 video=${WIDTH}x${HEIGHT}-32 earlycon devtmpfs.mount=1 rw" \
     -device virtio-gpu-pci,xres=$WIDTH,yres=$HEIGHT \
     -device virtio-tablet-pci \
+    -netdev user,id=net0,hostfwd=tcp::8088-:8088 \
+    -device virtio-net-pci,netdev=net0 \
     -display "$DISPLAY_OPT" \
     -serial stdio
