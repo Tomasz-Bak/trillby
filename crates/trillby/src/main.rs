@@ -4,8 +4,8 @@
 
 //! Trillby PID-1 binary.
 //!
-//! Boot path: kernel execs `/init` -> glibc crt1 `_start` -> `__libc_start_main`
-//! -> [`main`] -> [`init::setup_pid1`] -> UI poll loop in [`run_app`].
+//! Boot path: kernel execs `/init` -> musl crt1 `_start` -> [`main`]
+//! -> [`init::setup_pid1`] -> UI poll loop in [`run_app`].
 
 extern crate libc;
 
@@ -14,26 +14,10 @@ mod fb;
 mod init;
 
 // ---------------------------------------------------------------------------
-// Linking & entry
+// Entry point
 // ---------------------------------------------------------------------------
 
-// The `libc` crate emits no `-lc` in no_std builds, so declare it ourselves.
-// kind="static" makes rustc wrap it in -Bstatic (a raw `-C link-arg=-lc` lands
-// after rustc's trailing `-Wl,-Bdynamic` and silently links libc.so.6).
-#[cfg(all(not(test), target_feature = "crt-static"))]
-#[link(name = "c", kind = "static", modifiers = "-bundle")]
-#[link(name = "gcc_eh", kind = "static", modifiers = "-bundle")]
-#[link(name = "gcc", kind = "static", modifiers = "-bundle")]
-extern "C" {}
-// libgcc.a calls back into libc.a (__getauxval, pthread_*): close the cycle.
-#[cfg(all(not(test), target_feature = "crt-static"))]
-#[link(name = "c", kind = "static", modifiers = "-bundle")]
-extern "C" {}
-
-// Entered via glibc's crt1.o `_start` -> `__libc_start_main` -> `main`.
-// A hand-rolled `_start` is NOT viable with static glibc: it skips IRELATIVE
-// (ifunc) relocation processing and TLS setup, so the first `memcpy`/`write`
-// jumps through an unresolved slot and init dies with SIGSEGV.
+// Entered via musl's crt1.o `_start` -> `main`.
 #[cfg(not(test))]
 #[no_mangle]
 pub extern "C" fn main(_argc: libc::c_int, _argv: *const *const libc::c_char) -> libc::c_int {
