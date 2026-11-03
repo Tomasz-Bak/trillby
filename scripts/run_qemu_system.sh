@@ -46,6 +46,8 @@ elif qemu-system-aarch64 -display help 2>&1 | grep -q "sdl"; then
 fi
 
 echo "Selected display backend: $DISPLAY_OPT"
+echo "Serial stdin commands (/dev/ttyAMA0):"
+echo "  rfid <id> | barcode <code> | type <text> | click <x> <y> | scale <max_x> <max_y>"
 
 exec qemu-system-aarch64 \
     -M virt \

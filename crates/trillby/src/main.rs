@@ -108,17 +108,19 @@ const QEMU_RAW_MAX_X: i64 = ((32767 * 340) / 800) * 2; // 27850
 #[cfg(feature = "qemu-sim")]
 const QEMU_RAW_MAX_Y: i64 = ((32767 * 222) / 480) * 2; // 30308
 
-fn scale_touch_point(raw_x: i32, raw_y: i32) -> Point {
+fn scale_touch_point(raw_x: i32, raw_y: i32, max_x: i64, max_y: i64) -> Point {
     #[cfg(feature = "qemu-sim")]
     {
-        // virtio-tablet-pci reports 0..32767 absolute range in QEMU simulation mode
-        let x = (raw_x.clamp(0, QEMU_RAW_MAX_X as i32) as i64 * 800 / QEMU_RAW_MAX_X) as i32;
-        let y = (raw_y.clamp(0, QEMU_RAW_MAX_Y as i32) as i64 * 480 / QEMU_RAW_MAX_Y) as i32;
+        let mx = max_x.max(1);
+        let my = max_y.max(1);
+        let x = (raw_x.clamp(0, mx as i32) as i64 * 800 / mx) as i32;
+        let y = (raw_y.clamp(0, my as i32) as i64 * 480 / my) as i32;
         Point::new(x.clamp(0, 799), y.clamp(0, 479))
     }
 
     #[cfg(not(feature = "qemu-sim"))]
     {
+        let _ = (max_x, max_y);
         // Physical touchscreens report direct 1:1 pixel coordinates (0..799, 0..479)
         Point::new(raw_x.clamp(0, 799), raw_y.clamp(0, 479))
     }
@@ -177,6 +179,7 @@ fn run_app() {
     #[cfg(feature = "qemu-sim")]
     if tty_fd >= 0 {
         raw_print("Serial stdin listener enabled on /dev/ttyAMA0\n");
+        raw_print("  Commands: rfid <id> | barcode <code> | type <text> | click <x> <y> | scale <max_x> <max_y>\n");
     }
 
     // Open evdev devices (/dev/input/event0 .. event9)
@@ -203,10 +206,16 @@ fn run_app() {
     let mut last_heartbeat_ms: u64 = 0;
 
     #[cfg(feature = "qemu-sim")]
+    let mut touch_max_x: i64 = QEMU_RAW_MAX_X;
+    #[cfg(feature = "qemu-sim")]
+    let mut touch_max_y: i64 = QEMU_RAW_MAX_Y;
+    #[cfg(not(feature = "qemu-sim"))]
+    let (touch_max_x, touch_max_y): (i64, i64) = (799, 479);
+
+    #[cfg(feature = "qemu-sim")]
     let mut serial_line_buf = [0u8; 128];
     #[cfg(feature = "qemu-sim")]
     let mut serial_line_len = 0;
-
     // Single-threaded zero-allocation POSIX poll loop with centralized timeout
     loop {
         let mut pollfds: [libc::pollfd; 16] = unsafe { core::mem::zeroed() };
@@ -278,6 +287,24 @@ fn run_app() {
                                                     state.apply_key(trillby_core::Key::Char(c));
                                                 }
                                                 state.dirty = true;
+                                            } else if let Some(rest) = trimmed.strip_prefix("scale ") {
+                                                let mut parts = rest.split_whitespace();
+                                                if let (Some(mx_str), Some(my_str)) = (parts.next(), parts.next()) {
+                                                    if let (Ok(mx), Ok(my)) = (mx_str.parse::<i64>(), my_str.parse::<i64>()) {
+                                                        if mx > 0 && my > 0 {
+                                                            touch_max_x = mx;
+                                                            touch_max_y = my;
+                                                            let mut log_buf = [0u8; 96];
+                                                            use core::fmt::Write;
+                                                            let mut w = BufferWriter::new(&mut log_buf);
+                                                            let _ = write!(w, "[TOUCH] scale max updated -> ({}, {})\n", touch_max_x, touch_max_y);
+                                                            let len = w.offset;
+                                                            if let Ok(s) = core::str::from_utf8(&log_buf[..len]) {
+                                                                raw_print(s);
+                                                            }
+                                                        }
+                                                    }
+                                                }
                                             } else if let Some(rest) = trimmed.strip_prefix("click ") {
                                                 let mut parts = rest.split_whitespace();
                                                 if let (Some(x_str), Some(y_str)) = (parts.next(), parts.next()) {
@@ -339,11 +366,26 @@ fn run_app() {
                                 }
                                 1 => { // EV_KEY
                                     if ev.code == 330 || ev.code == 272 { // BTN_TOUCH or BTN_LEFT
-                                        let eg_pt = scale_touch_point(raw_x, raw_y);
+                                        let eg_pt = scale_touch_point(raw_x, raw_y, touch_max_x, touch_max_y);
                                         let core_pt = CorePoint::new(eg_pt.x, eg_pt.y);
                                         if ev.value == 1 {
                                             is_touch_down = true;
                                             touch_moved = false;
+                                            #[cfg(feature = "qemu-sim")]
+                                            {
+                                                let mut log_buf = [0u8; 128];
+                                                use core::fmt::Write;
+                                                let mut w = BufferWriter::new(&mut log_buf);
+                                                let _ = write!(
+                                                    w,
+                                                    "[TOUCH] raw=({}, {}) scaled=({}, {}) max=({}, {})\n",
+                                                    raw_x, raw_y, core_pt.x, core_pt.y, touch_max_x, touch_max_y
+                                                );
+                                                let len = w.offset;
+                                                if let Ok(s) = core::str::from_utf8(&log_buf[..len]) {
+                                                    raw_print(s);
+                                                }
+                                            }
                                             let key = zones.keyboard_area.and_then(|kb| KeyboardGrid::resolve_key(kb, eg_pt, state.keyboard_layer));
                                             state.handle_event(UiEvent::TouchDown { scaled: core_pt, raw: (raw_x, raw_y) }, core_bounds, core_kb_bounds, key);
                                         } else if ev.value == 0 {
@@ -363,7 +405,7 @@ fn run_app() {
 
             // After draining all queues, if we moved while down, dispatch one coalesced TouchMove
             if is_touch_down && touch_moved {
-                let eg_pt = scale_touch_point(raw_x, raw_y);
+                let eg_pt = scale_touch_point(raw_x, raw_y, touch_max_x, touch_max_y);
                 let core_pt = CorePoint::new(eg_pt.x, eg_pt.y);
                 let key = zones.keyboard_area.and_then(|kb| KeyboardGrid::resolve_key(kb, eg_pt, state.keyboard_layer));
                 state.handle_event(UiEvent::TouchMove { scaled: core_pt, raw: (raw_x, raw_y) }, core_bounds, core_kb_bounds, key);
