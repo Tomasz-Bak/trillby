@@ -5,13 +5,13 @@ use embedded_graphics::{
 };
 use embedded_graphics_framebuf::FrameBuf;
 use trillby_core::{
-    Key, Point as CorePoint, UiEvent, UiState,
+    HeaderButton, Key, Point as CorePoint, Screen, SessionState, UiEvent, UiState,
 };
 use trillby_ui::{eg_rect_to_core, KeyboardGrid, LayoutZones, UiRenderer};
 
 #[test]
 fn test_ui_full_interaction_lifecycle() {
-    // 1. Initialize 800x480 screen bounds and target pixel buffer
+    // 1. Initialize 800x480 screen bounds and target pixel buffer (Idle state)
     let screen_bounds = Rectangle::new(Point::zero(), Size::new(800, 480));
     let core_screen_bounds = eg_rect_to_core(screen_bounds);
     let mut pixels = [Rgb565::new(0, 0, 0); 800 * 480];
@@ -19,21 +19,57 @@ fn test_ui_full_interaction_lifecycle() {
     let mut state: UiState<256> = UiState::new();
     let renderer = UiRenderer::new(screen_bounds);
 
-    // Initial render pass
+    assert_eq!(state.current_screen, Screen::Operator);
+    assert_eq!(state.session.state(), &SessionState::Idle);
+    assert!(!state.keyboard_visible);
+
+    // Render Idle state
     {
         let mut framebuffer = FrameBuf::new(&mut pixels, 800, 480);
         assert!(renderer.render(&mut framebuffer, &state).is_ok());
     }
 
-    // 2. Dispatch RFID Card scan event
+    // 2. Dispatch RFID Card scan event -> Authenticated, auto-hidden keyboard
     let card_id = heapless::String::try_from("OP_CARD_9921").unwrap();
     state.handle_event(UiEvent::RfidScanned(card_id), core_screen_bounds, None, None);
 
-    assert_eq!(state.input_buffer.as_str(), "OP_CARD_9921");
+    assert!(matches!(
+        state.session.state(),
+        SessionState::Authenticated { operator_id } if operator_id.as_str() == "OP_CARD_9921"
+    ));
+    assert!(!state.keyboard_visible);
     assert_eq!(state.rfid_count, 1);
     assert!(state.dirty);
 
-    // 3. Resolve virtual keyboard key touch (Q key at x=40, y=320)
+    {
+        let mut framebuffer = FrameBuf::new(&mut pixels, 800, 480);
+        assert!(renderer.render(&mut framebuffer, &state).is_ok());
+    }
+
+    // 3. Dispatch Barcode scan event -> Working, auto-shown keyboard
+    let job_id = heapless::String::try_from("JOB_404").unwrap();
+    state.handle_event(
+        UiEvent::BarcodeScanned(job_id.clone()),
+        core_screen_bounds,
+        None,
+        None,
+    );
+
+    assert!(matches!(
+        state.session.state(),
+        SessionState::Working { operator_id, job_id, .. }
+            if operator_id.as_str() == "OP_CARD_9921" && job_id.as_str() == "JOB_404"
+    ));
+    assert!(state.keyboard_visible);
+    assert_eq!(state.barcode_count, 1);
+    assert_eq!(state.input_buffer.as_str(), "");
+
+    {
+        let mut framebuffer = FrameBuf::new(&mut pixels, 800, 480);
+        assert!(renderer.render(&mut framebuffer, &state).is_ok());
+    }
+
+    // 4. Touch 'Q' key on virtual keyboard (x=40, y=320) -> input_buffer == "Q"
     let touch_point = Point::new(40, 320);
     let core_touch_point = CorePoint::new(40, 320);
 
@@ -45,7 +81,6 @@ fn test_ui_full_interaction_lifecycle() {
     });
     assert_eq!(key_hit, Some(Key::Char('Q')));
 
-    // Dispatch TouchDown
     state.handle_event(
         UiEvent::TouchDown {
             scaled: core_touch_point,
@@ -59,7 +94,6 @@ fn test_ui_full_interaction_lifecycle() {
     assert_eq!(state.active_touch_key, Some(Key::Char('Q')));
     assert_eq!(state.touch_count, 1);
 
-    // Dispatch TouchUp
     state.handle_event(
         UiEvent::TouchUp {
             scaled: core_touch_point,
@@ -70,12 +104,59 @@ fn test_ui_full_interaction_lifecycle() {
         key_hit,
     );
 
-    assert_eq!(state.input_buffer.as_str(), "OP_CARD_9921Q");
+    assert_eq!(state.input_buffer.as_str(), "Q");
     assert_eq!(state.key_count, 1);
     assert_eq!(state.last_key_pressed, Some(Key::Char('Q')));
     assert!(state.dirty);
 
-    // 4. Repaint dirty framebuffer
+    {
+        let mut framebuffer = FrameBuf::new(&mut pixels, 800, 480);
+        assert!(renderer.render(&mut framebuffer, &state).is_ok());
+    }
+
+    // 5. Matching BarcodeScanned -> Authenticated, auto-hidden keyboard
+    state.handle_event(
+        UiEvent::BarcodeScanned(job_id),
+        core_screen_bounds,
+        None,
+        None,
+    );
+    assert!(matches!(
+        state.session.state(),
+        SessionState::Authenticated { operator_id } if operator_id.as_str() == "OP_CARD_9921"
+    ));
+    assert!(!state.keyboard_visible);
+    assert_eq!(state.barcode_count, 2);
+
+    {
+        let mut framebuffer = FrameBuf::new(&mut pixels, 800, 480);
+        assert!(renderer.render(&mut framebuffer, &state).is_ok());
+    }
+
+    // 6. Tap HeaderButton::Debug -> Screen::Debug and render cleanly
+    let debug_rect = HeaderButton::Debug.rect();
+    let debug_point = CorePoint::new(debug_rect.top_left.x + 10, debug_rect.top_left.y + 10);
+    state.handle_event(
+        UiEvent::TouchDown {
+            scaled: debug_point,
+            raw: (20000, 2000),
+        },
+        core_screen_bounds,
+        None,
+        None,
+    );
+    state.handle_event(
+        UiEvent::TouchUp {
+            scaled: debug_point,
+            raw: (20000, 2000),
+        },
+        core_screen_bounds,
+        None,
+        None,
+    );
+    assert_eq!(state.current_screen, Screen::Debug);
+    assert!(state.dirty);
+
     if state.dirty {
         let mut framebuffer = FrameBuf::new(&mut pixels, 800, 480);
         assert!(renderer.render(&mut framebuffer, &state).is_ok());

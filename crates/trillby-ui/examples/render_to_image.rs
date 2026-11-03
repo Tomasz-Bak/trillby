@@ -41,8 +41,6 @@ fn dump_ui_state(visible: bool, layer: KeyboardLayer, filename_base: &str) -> st
     let mut pixels = [Rgb565::new(0, 0, 0); 800 * 480];
 
     let mut state: UiState<256> = UiState::new();
-    state.keyboard_visible = visible;
-    state.keyboard_layer = layer;
     let renderer = UiRenderer::new(screen_bounds);
 
     // Populate static demonstration telemetry data
@@ -62,6 +60,8 @@ fn dump_ui_state(visible: bool, layer: KeyboardLayer, filename_base: &str) -> st
         None,
     );
 
+    state.keyboard_visible = visible;
+    state.keyboard_layer = layer;
     // Render UI frame onto target FrameBuf
     let mut framebuffer = FrameBuf::new(&mut pixels, width, height);
     renderer.render(&mut framebuffer, &state).expect("Failed to render UI frame");
