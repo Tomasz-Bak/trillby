@@ -103,12 +103,17 @@ pub(crate) fn raw_print(msg: &str) {
 }
 
 
+#[cfg(feature = "qemu-sim")]
+const QEMU_RAW_MAX_X: i64 = ((32767 * 340) / 800) * 2; // 27850
+#[cfg(feature = "qemu-sim")]
+const QEMU_RAW_MAX_Y: i64 = ((32767 * 222) / 480) * 2; // 30308
+
 fn scale_touch_point(raw_x: i32, raw_y: i32) -> Point {
     #[cfg(feature = "qemu-sim")]
     {
         // virtio-tablet-pci reports 0..32767 absolute range in QEMU simulation mode
-        let x = (raw_x.clamp(0, 32767) as i64 * 800 / 32767) as i32;
-        let y = (raw_y.clamp(0, 32767) as i64 * 480 / 32767) as i32;
+        let x = (raw_x.clamp(0, QEMU_RAW_MAX_X as i32) as i64 * 800 / QEMU_RAW_MAX_X) as i32;
+        let y = (raw_y.clamp(0, QEMU_RAW_MAX_Y as i32) as i64 * 480 / QEMU_RAW_MAX_Y) as i32;
         Point::new(x.clamp(0, 799), y.clamp(0, 479))
     }
 
