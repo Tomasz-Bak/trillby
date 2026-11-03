@@ -40,11 +40,15 @@ impl HeaderButton {
     }
 }
 
-pub const DEBUG_STOP_JOB_BUTTON: Rect = Rect::new(Point::new(287, 190), 226, 36);
-pub const DEBUG_LOGOUT_BUTTON: Rect = Rect::new(Point::new(287, 234), 226, 36);
+pub const DEBUG_AUTH_USER_BUTTON: Rect = Rect::new(Point::new(287, 190), 109, 36);
+pub const DEBUG_START_JOB_BUTTON: Rect = Rect::new(Point::new(404, 190), 109, 36);
+pub const DEBUG_STOP_JOB_BUTTON: Rect = Rect::new(Point::new(287, 234), 109, 36);
+pub const DEBUG_LOGOUT_BUTTON: Rect = Rect::new(Point::new(404, 234), 109, 36);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DebugButton {
+    AuthUser,
+    StartJob,
     StopJob,
     Logout,
 }
@@ -52,13 +56,15 @@ pub enum DebugButton {
 impl DebugButton {
     pub const fn rect(self) -> Rect {
         match self {
+            Self::AuthUser => DEBUG_AUTH_USER_BUTTON,
+            Self::StartJob => DEBUG_START_JOB_BUTTON,
             Self::StopJob => DEBUG_STOP_JOB_BUTTON,
             Self::Logout => DEBUG_LOGOUT_BUTTON,
         }
     }
 
     pub fn at(p: Point) -> Option<Self> {
-        [Self::StopJob, Self::Logout]
+        [Self::AuthUser, Self::StartJob, Self::StopJob, Self::Logout]
             .into_iter()
             .find(|b| b.rect().contains(p))
     }

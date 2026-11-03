@@ -196,6 +196,30 @@ impl<const N: usize> UiState<N> {
                 if !in_kb && self.current_screen == Screen::Debug {
                     if let Some(dbg_btn) = DebugButton::at(scaled) {
                         match dbg_btn {
+                            DebugButton::AuthUser => {
+                                if self.session.force_authenticate(
+                                    crate::session::DUMMY_OPERATOR_ID,
+                                    self.tick_count,
+                                ) {
+                                    self.keyboard_visible = false;
+                                    self.input_buffer.clear();
+                                    let _ = self
+                                        .input_buffer
+                                        .push_str(crate::session::DUMMY_OPERATOR_ID);
+                                    self.push_event_log("Debug: Authenticated Dummy User");
+                                }
+                            }
+                            DebugButton::StartJob => {
+                                if self.session.force_start_job(
+                                    crate::session::DUMMY_OPERATOR_ID,
+                                    crate::session::DUMMY_JOB_ID,
+                                    self.tick_count,
+                                ) {
+                                    self.keyboard_visible = true;
+                                    self.input_buffer.clear();
+                                    self.push_event_log("Debug: Started Dummy Job");
+                                }
+                            }
                             DebugButton::StopJob => {
                                 if self.session.force_stop_job(self.tick_count) {
                                     self.keyboard_visible = false;
@@ -324,8 +348,10 @@ impl<const N: usize> UiState<N> {
 mod tests {
     use super::*;
     use crate::header::{
-        DEBUG_BUTTON, DEBUG_LOGOUT_BUTTON, DEBUG_STOP_JOB_BUTTON, KEYBOARD_BUTTON,
+        DEBUG_AUTH_USER_BUTTON, DEBUG_BUTTON, DEBUG_LOGOUT_BUTTON, DEBUG_START_JOB_BUTTON,
+        DEBUG_STOP_JOB_BUTTON, KEYBOARD_BUTTON,
     };
+    use crate::session::{DUMMY_JOB_ID, DUMMY_OPERATOR_ID};
 
     fn tap(state: &mut UiState<64>, p: Point) {
         let screen = Rect::new(Point::zero(), 800, 480);
@@ -525,6 +551,130 @@ mod tests {
             Some(SessionEvent::OperatorLogout {
                 operator_id: badge,
                 tick: 6,
+            })
+        );
+    }
+
+    #[test]
+    fn debug_screen_auth_user_and_start_job_buttons() {
+        let mut s: UiState<64> = UiState::new();
+        let screen = Rect::new(Point::zero(), 800, 480);
+        let dummy_op: String<32> = String::try_from(DUMMY_OPERATOR_ID).unwrap();
+        let dummy_job: String<64> = String::try_from(DUMMY_JOB_ID).unwrap();
+
+        // Switch to Debug screen
+        tap(&mut s, Point::new(DEBUG_BUTTON.top_left.x + 5, 10));
+        assert_eq!(s.current_screen, Screen::Debug);
+
+        // 1. Tap AUTH USER from Idle -> Authenticated with DUMMY_OPERATOR_ID
+        let auth_pt = Point::new(
+            DEBUG_AUTH_USER_BUTTON.top_left.x + 10,
+            DEBUG_AUTH_USER_BUTTON.top_left.y + 10,
+        );
+        s.handle_event(UiEvent::TouchDown { scaled: auth_pt, raw: (0, 0) }, screen, None, None);
+        assert_eq!(s.pressed_debug, Some(DebugButton::AuthUser));
+        s.handle_event(UiEvent::TouchUp { scaled: auth_pt, raw: (0, 0) }, screen, None, None);
+        assert_eq!(s.pressed_debug, None);
+        assert!(!s.keyboard_visible);
+        assert_eq!(s.input_buffer.as_str(), DUMMY_OPERATOR_ID);
+        assert_eq!(s.last_event_desc.as_str(), "Debug: Authenticated Dummy User");
+        assert_eq!(
+            s.session_state(),
+            &SessionState::Authenticated {
+                operator_id: dummy_op.clone()
+            }
+        );
+        assert_eq!(
+            s.pop_session_event(),
+            Some(SessionEvent::OperatorLogin {
+                operator_id: dummy_op.clone(),
+                tick: 0,
+            })
+        );
+
+        // 2. Tap START JOB -> Working with DUMMY_JOB_ID
+        let start_pt = Point::new(
+            DEBUG_START_JOB_BUTTON.top_left.x + 10,
+            DEBUG_START_JOB_BUTTON.top_left.y + 10,
+        );
+        s.handle_event(UiEvent::TouchDown { scaled: start_pt, raw: (0, 0) }, screen, None, None);
+        assert_eq!(s.pressed_debug, Some(DebugButton::StartJob));
+        s.handle_event(UiEvent::TouchUp { scaled: start_pt, raw: (0, 0) }, screen, None, None);
+        assert_eq!(s.pressed_debug, None);
+        assert!(s.keyboard_visible);
+        assert_eq!(s.input_buffer.as_str(), "");
+        assert_eq!(s.last_event_desc.as_str(), "Debug: Started Dummy Job");
+        assert_eq!(
+            s.session_state(),
+            &SessionState::Working {
+                operator_id: dummy_op.clone(),
+                job_id: dummy_job.clone(),
+                started_at_tick: 0,
+            }
+        );
+        assert_eq!(
+            s.pop_session_event(),
+            Some(SessionEvent::WorkStart {
+                operator_id: dummy_op.clone(),
+                job_id: dummy_job.clone(),
+                started_at_tick: 0,
+            })
+        );
+
+        // 3. Hide keyboard, tap AUTH USER while Working -> transitions back to Authenticated
+        tap(&mut s, Point::new(KEYBOARD_BUTTON.top_left.x + 5, 10));
+        assert!(!s.keyboard_visible);
+        tap(&mut s, auth_pt);
+        assert_eq!(
+            s.session_state(),
+            &SessionState::Authenticated {
+                operator_id: dummy_op.clone()
+            }
+        );
+        assert_eq!(s.input_buffer.as_str(), DUMMY_OPERATOR_ID);
+        assert_eq!(
+            s.pop_session_event(),
+            Some(SessionEvent::WorkStop {
+                operator_id: dummy_op.clone(),
+                job_id: dummy_job.clone(),
+                started_at_tick: 0,
+                stopped_at_tick: 0,
+                duration_ms: 0,
+            })
+        );
+
+        // 4. Logout, then tap START JOB directly from Idle -> auto-authenticates and starts job
+        let logout_pt = Point::new(
+            DEBUG_LOGOUT_BUTTON.top_left.x + 10,
+            DEBUG_LOGOUT_BUTTON.top_left.y + 10,
+        );
+        tap(&mut s, logout_pt);
+        let _ = s.pop_session_event();
+        assert_eq!(s.session_state(), &SessionState::Idle);
+
+        tap(&mut s, start_pt);
+        assert!(s.keyboard_visible);
+        assert_eq!(
+            s.session_state(),
+            &SessionState::Working {
+                operator_id: dummy_op.clone(),
+                job_id: dummy_job.clone(),
+                started_at_tick: 0,
+            }
+        );
+        assert_eq!(
+            s.pop_session_event(),
+            Some(SessionEvent::OperatorLogin {
+                operator_id: dummy_op.clone(),
+                tick: 0,
+            })
+        );
+        assert_eq!(
+            s.pop_session_event(),
+            Some(SessionEvent::WorkStart {
+                operator_id: dummy_op,
+                job_id: dummy_job,
+                started_at_tick: 0,
             })
         );
     }

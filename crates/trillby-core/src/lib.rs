@@ -11,12 +11,16 @@ pub mod state;
 pub use event::UiEvent;
 pub use geometry::{Point, Rect};
 pub use header::{
-    DebugButton, HeaderButton, CLEAR_BUTTON, DEBUG_BUTTON, DEBUG_LOGOUT_BUTTON,
-    DEBUG_STOP_JOB_BUTTON, HEADER_HEIGHT, KEYBOARD_BUTTON,
+    DebugButton, HeaderButton, CLEAR_BUTTON, DEBUG_AUTH_USER_BUTTON, DEBUG_BUTTON,
+    DEBUG_LOGOUT_BUTTON, DEBUG_START_JOB_BUTTON, DEBUG_STOP_JOB_BUTTON, HEADER_HEIGHT,
+    KEYBOARD_BUTTON,
 };
 pub use keyboard_types::{Key, KeyboardLayer};
 pub use net_types::NetworkStatus;
-pub use session::{OperatorSession, SessionEvent, SessionRejectReason, SessionState};
+pub use session::{
+    OperatorSession, SessionEvent, SessionRejectReason, SessionState, DUMMY_JOB_ID,
+    DUMMY_OPERATOR_ID,
+};
 pub use state::{Screen, UiState};
 
 /// Target idle poll frequency in Hertz (Hz).

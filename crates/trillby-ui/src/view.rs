@@ -376,6 +376,28 @@ impl UiRenderer {
                     }
 
                     if cards_h >= 180 {
+                        Button::new(core_rect_to_eg(DebugButton::AuthUser.rect()), "AUTH USER")
+                            .variant(
+                                if matches!(state.session.state(), SessionState::Idle) {
+                                    ButtonVariant::Primary
+                                } else {
+                                    ButtonVariant::Secondary
+                                },
+                            )
+                            .pressed(state.pressed_debug == Some(DebugButton::AuthUser))
+                            .draw(target, &self.theme)?;
+
+                        Button::new(core_rect_to_eg(DebugButton::StartJob.rect()), "START JOB")
+                            .variant(
+                                if !matches!(state.session.state(), SessionState::Working { .. }) {
+                                    ButtonVariant::Primary
+                                } else {
+                                    ButtonVariant::Secondary
+                                },
+                            )
+                            .pressed(state.pressed_debug == Some(DebugButton::StartJob))
+                            .draw(target, &self.theme)?;
+
                         Button::new(core_rect_to_eg(DebugButton::StopJob.rect()), "STOP JOB")
                             .variant(
                                 if matches!(state.session.state(), SessionState::Working { .. }) {

@@ -1,5 +1,8 @@
 use heapless::{String, Vec};
 
+pub const DUMMY_OPERATOR_ID: &str = "DUMMY_OP_01";
+pub const DUMMY_JOB_ID: &str = "DUMMY_JOB_01";
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum SessionState {
     #[default]
@@ -224,6 +227,114 @@ impl OperatorSession {
         }
     }
 
+
+    pub fn force_authenticate(&mut self, badge: &str, tick: u64) -> bool {
+        let badge_id: String<32> = to_bounded_string(badge);
+        match &self.state {
+            SessionState::Idle => {
+                self.state = SessionState::Authenticated {
+                    operator_id: badge_id.clone(),
+                };
+                self.enqueue(SessionEvent::OperatorLogin {
+                    operator_id: badge_id,
+                    tick,
+                });
+                true
+            }
+            SessionState::Authenticated { operator_id } => {
+                if *operator_id == badge_id {
+                    false
+                } else {
+                    let old_op = operator_id.clone();
+                    self.state = SessionState::Authenticated {
+                        operator_id: badge_id.clone(),
+                    };
+                    self.enqueue(SessionEvent::OperatorLogout {
+                        operator_id: old_op,
+                        tick,
+                    });
+                    self.enqueue(SessionEvent::OperatorLogin {
+                        operator_id: badge_id,
+                        tick,
+                    });
+                    true
+                }
+            }
+            SessionState::Working {
+                operator_id,
+                job_id,
+                started_at_tick,
+            } => {
+                let old_op = operator_id.clone();
+                let active_job = job_id.clone();
+                let start_tick = *started_at_tick;
+                let duration_ms = tick
+                    .saturating_sub(start_tick)
+                    .saturating_mul(crate::POLL_TIMEOUT_MS as u64);
+
+                self.state = SessionState::Authenticated {
+                    operator_id: badge_id.clone(),
+                };
+                self.enqueue(SessionEvent::WorkStop {
+                    operator_id: old_op.clone(),
+                    job_id: active_job,
+                    started_at_tick: start_tick,
+                    stopped_at_tick: tick,
+                    duration_ms,
+                });
+                if old_op != badge_id {
+                    self.enqueue(SessionEvent::OperatorLogout {
+                        operator_id: old_op,
+                        tick,
+                    });
+                    self.enqueue(SessionEvent::OperatorLogin {
+                        operator_id: badge_id,
+                        tick,
+                    });
+                }
+                true
+            }
+        }
+    }
+
+    pub fn force_start_job(&mut self, default_badge: &str, code: &str, tick: u64) -> bool {
+        let code_id: String<64> = to_bounded_string(code);
+        match &self.state {
+            SessionState::Idle => {
+                let op_id: String<32> = to_bounded_string(default_badge);
+                self.state = SessionState::Working {
+                    operator_id: op_id.clone(),
+                    job_id: code_id.clone(),
+                    started_at_tick: tick,
+                };
+                self.enqueue(SessionEvent::OperatorLogin {
+                    operator_id: op_id.clone(),
+                    tick,
+                });
+                self.enqueue(SessionEvent::WorkStart {
+                    operator_id: op_id,
+                    job_id: code_id,
+                    started_at_tick: tick,
+                });
+                true
+            }
+            SessionState::Authenticated { operator_id } => {
+                let op_id = operator_id.clone();
+                self.state = SessionState::Working {
+                    operator_id: op_id.clone(),
+                    job_id: code_id.clone(),
+                    started_at_tick: tick,
+                };
+                self.enqueue(SessionEvent::WorkStart {
+                    operator_id: op_id,
+                    job_id: code_id,
+                    started_at_tick: tick,
+                });
+                true
+            }
+            SessionState::Working { .. } => false,
+        }
+    }
     pub fn force_stop_job(&mut self, tick: u64) -> bool {
         match &self.state {
             SessionState::Working {
@@ -596,6 +707,173 @@ mod tests {
             Some(SessionEvent::OperatorLogout {
                 operator_id: s32("OP-2"),
                 tick: 40,
+            })
+        );
+        assert_eq!(session.pop_event(), None);
+    }
+
+    #[test]
+    fn force_authenticate_from_idle_authenticated_and_working() {
+        let mut session = OperatorSession::new();
+
+        // 1. From Idle -> Authenticated
+        assert!(session.force_authenticate(DUMMY_OPERATOR_ID, 5));
+        assert_eq!(
+            session.state(),
+            &SessionState::Authenticated {
+                operator_id: s32(DUMMY_OPERATOR_ID)
+            }
+        );
+        assert_eq!(
+            session.pop_event(),
+            Some(SessionEvent::OperatorLogin {
+                operator_id: s32(DUMMY_OPERATOR_ID),
+                tick: 5,
+            })
+        );
+        assert_eq!(session.pop_event(), None);
+
+        // 2. Already Authenticated with same badge -> no-op
+        assert!(!session.force_authenticate(DUMMY_OPERATOR_ID, 10));
+        assert_eq!(session.pop_event(), None);
+
+        // 3. Authenticated with different badge -> switches operator
+        assert!(session.force_authenticate("OP-2", 12));
+        assert_eq!(
+            session.state(),
+            &SessionState::Authenticated {
+                operator_id: s32("OP-2")
+            }
+        );
+        assert_eq!(
+            session.pop_event(),
+            Some(SessionEvent::OperatorLogout {
+                operator_id: s32(DUMMY_OPERATOR_ID),
+                tick: 12,
+            })
+        );
+        assert_eq!(
+            session.pop_event(),
+            Some(SessionEvent::OperatorLogin {
+                operator_id: s32("OP-2"),
+                tick: 12,
+            })
+        );
+        assert_eq!(session.pop_event(), None);
+
+        // 4. From Working with same operator -> stops job and stays Authenticated
+        assert_eq!(session.handle_barcode("JOB-1", 20), Ok(()));
+        let _ = session.pop_event();
+        assert!(session.force_authenticate("OP-2", 30));
+        assert_eq!(
+            session.state(),
+            &SessionState::Authenticated {
+                operator_id: s32("OP-2")
+            }
+        );
+        assert_eq!(
+            session.pop_event(),
+            Some(SessionEvent::WorkStop {
+                operator_id: s32("OP-2"),
+                job_id: s64("JOB-1"),
+                started_at_tick: 20,
+                stopped_at_tick: 30,
+                duration_ms: 10 * (crate::POLL_TIMEOUT_MS as u64),
+            })
+        );
+        assert_eq!(session.pop_event(), None);
+
+        // 5. From Working with different operator -> stops job and switches operator
+        assert_eq!(session.handle_barcode("JOB-2", 40), Ok(()));
+        let _ = session.pop_event();
+        assert!(session.force_authenticate(DUMMY_OPERATOR_ID, 50));
+        assert_eq!(
+            session.state(),
+            &SessionState::Authenticated {
+                operator_id: s32(DUMMY_OPERATOR_ID)
+            }
+        );
+        assert_eq!(
+            session.pop_event(),
+            Some(SessionEvent::WorkStop {
+                operator_id: s32("OP-2"),
+                job_id: s64("JOB-2"),
+                started_at_tick: 40,
+                stopped_at_tick: 50,
+                duration_ms: 10 * (crate::POLL_TIMEOUT_MS as u64),
+            })
+        );
+        assert_eq!(
+            session.pop_event(),
+            Some(SessionEvent::OperatorLogout {
+                operator_id: s32("OP-2"),
+                tick: 50,
+            })
+        );
+        assert_eq!(
+            session.pop_event(),
+            Some(SessionEvent::OperatorLogin {
+                operator_id: s32(DUMMY_OPERATOR_ID),
+                tick: 50,
+            })
+        );
+        assert_eq!(session.pop_event(), None);
+    }
+
+    #[test]
+    fn force_start_job_from_idle_authenticated_and_working() {
+        let mut session = OperatorSession::new();
+
+        // 1. From Idle -> auto-authenticates default_badge and starts job
+        assert!(session.force_start_job(DUMMY_OPERATOR_ID, DUMMY_JOB_ID, 10));
+        assert_eq!(
+            session.state(),
+            &SessionState::Working {
+                operator_id: s32(DUMMY_OPERATOR_ID),
+                job_id: s64(DUMMY_JOB_ID),
+                started_at_tick: 10,
+            }
+        );
+        assert_eq!(
+            session.pop_event(),
+            Some(SessionEvent::OperatorLogin {
+                operator_id: s32(DUMMY_OPERATOR_ID),
+                tick: 10,
+            })
+        );
+        assert_eq!(
+            session.pop_event(),
+            Some(SessionEvent::WorkStart {
+                operator_id: s32(DUMMY_OPERATOR_ID),
+                job_id: s64(DUMMY_JOB_ID),
+                started_at_tick: 10,
+            })
+        );
+        assert_eq!(session.pop_event(), None);
+
+        // 2. While Working -> returns false (no-op)
+        assert!(!session.force_start_job(DUMMY_OPERATOR_ID, "OTHER_JOB", 15));
+        assert_eq!(session.pop_event(), None);
+
+        // 3. From Authenticated -> starts job for current operator
+        session.clear();
+        session.handle_rfid("REAL-OP", 20);
+        let _ = session.pop_event();
+        assert!(session.force_start_job(DUMMY_OPERATOR_ID, DUMMY_JOB_ID, 25));
+        assert_eq!(
+            session.state(),
+            &SessionState::Working {
+                operator_id: s32("REAL-OP"),
+                job_id: s64(DUMMY_JOB_ID),
+                started_at_tick: 25,
+            }
+        );
+        assert_eq!(
+            session.pop_event(),
+            Some(SessionEvent::WorkStart {
+                operator_id: s32("REAL-OP"),
+                job_id: s64(DUMMY_JOB_ID),
+                started_at_tick: 25,
             })
         );
         assert_eq!(session.pop_event(), None);
