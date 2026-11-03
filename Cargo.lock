@@ -147,6 +147,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "trillby-server"
+version = "0.1.0"
+dependencies = [
+ "heapless",
+ "libc",
+ "trillby-net",
+]
+
+[[package]]
 name = "trillby-ui"
 version = "0.1.0"
 dependencies = [
