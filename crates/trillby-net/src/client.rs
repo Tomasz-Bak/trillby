@@ -15,12 +15,29 @@ use crate::packet::{
 use crate::posix::PosixSocket;
 use trillby_core::net_types::NetworkStatus;
 
+/// If the in-flight event is not ACKed within this window the link is presumed
+/// dead (half-open TCP, wedged server) and is torn down; the event is resent on
+/// the next session. TCP already guarantees delivery within a live connection,
+/// so there is no in-session retransmission.
+pub const ACK_TIMEOUT_MS: u64 = 10_000;
+
+/// Upper bound on recv() calls per poll step so a chatty peer can't starve the
+/// UI loop. poll() is level-triggered, so leftover data wakes us immediately.
+const MAX_RECV_PER_STEP: usize = 16;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientState {
     Disconnected { next_attempt_ms: u64, backoff_ms: u32 },
     Connecting,
     Handshaking,
     Online,
+}
+
+/// Outbox head that has been sealed and written to the current session.
+#[derive(Debug, Clone, Copy)]
+struct Inflight {
+    seq: u32,
+    sent_ms: u64,
 }
 
 pub struct NetClient<const OUTBOX_CAP: usize> {
@@ -37,6 +54,7 @@ pub struct NetClient<const OUTBOX_CAP: usize> {
     tx_seq: u32,
     rx_seq: u32,
     outbox: Outbox<OUTBOX_CAP>,
+    inflight: Option<Inflight>,
     rx_buf: [u8; MAX_FRAME_LEN * 2],
     rx_len: usize,
 }
@@ -65,6 +83,7 @@ impl<const OUTBOX_CAP: usize> NetClient<OUTBOX_CAP> {
             tx_seq: 1,
             rx_seq: 0,
             outbox: Outbox::new(),
+            inflight: None,
             rx_buf: [0u8; MAX_FRAME_LEN * 2],
             rx_len: 0,
         }
@@ -98,6 +117,20 @@ impl<const OUTBOX_CAP: usize> NetClient<OUTBOX_CAP> {
         self.outbox.len()
     }
 
+    /// Whether the poll loop should request `POLLOUT` for `socket_fd()`.
+    ///
+    /// True only while a connect is in progress or an outbox event is waiting
+    /// to be written. Do NOT derive this from `outbox_pending_count() > 0`: a
+    /// TCP socket is nearly always writable, so that would busy-spin the loop
+    /// for the whole time an event is waiting on its ACK.
+    pub fn wants_write(&self) -> bool {
+        match self.state {
+            ClientState::Connecting => true,
+            ClientState::Online => self.inflight.is_none() && !self.outbox.is_empty(),
+            _ => false,
+        }
+    }
+
     /// Enqueue an application data payload (MsgType::Data) for transmission.
     pub fn send_data(&mut self, data: &[u8]) -> Result<(), OutboxError> {
         self.enqueue_event(MsgType::Data, data)
@@ -117,25 +150,10 @@ impl<const OUTBOX_CAP: usize> NetClient<OUTBOX_CAP> {
         self.enqueue_event(MsgType::Heartbeat, &buf)
     }
 
-    /// Enqueue an event payload. If an active session is online, it will be
-    /// encrypted with the current session key and queued for transmission.
+    /// Enqueue an event payload (plaintext). It is sealed with whatever session
+    /// is current at transmit time, so it is safe to enqueue while offline.
     pub fn enqueue_event(&mut self, msg_type: MsgType, plaintext: &[u8]) -> Result<(), OutboxError> {
-        let seq = self.tx_seq;
-        self.tx_seq = self.tx_seq.wrapping_add(1);
-
-        let mut frame_buf = [0u8; MAX_FRAME_LEN];
-        let frame_len = pack_and_encrypt(
-            &self.session_key,
-            &self.session_salt,
-            msg_type,
-            self.session_id,
-            seq,
-            plaintext,
-            &mut frame_buf,
-        ).map_err(|_| OutboxError::FrameTooLarge)?;
-
-        self.outbox.push(seq, &frame_buf[..frame_len])?;
-        Ok(())
+        self.outbox.push(msg_type, plaintext)
     }
 
     /// Primary event loop step. Called by the poll loop on timeout or socket event.
@@ -212,7 +230,12 @@ impl<const OUTBOX_CAP: usize> NetClient<OUTBOX_CAP> {
                         self.receive_frames(now_ms, has_in, &mut on_data);
                     }
                     if self.state == ClientState::Online {
-                        self.flush_outbox();
+                        match self.inflight {
+                            Some(f) if now_ms.saturating_sub(f.sent_ms) >= ACK_TIMEOUT_MS => {
+                                self.transition_to_disconnected(now_ms, 2000);
+                            }
+                            _ => self.flush_outbox(now_ms),
+                        }
                     }
                 }
             }
@@ -229,6 +252,8 @@ impl<const OUTBOX_CAP: usize> NetClient<OUTBOX_CAP> {
     fn transition_to_disconnected(&mut self, now_ms: u64, prev_backoff: u32) {
         self.socket.close();
         self.rx_len = 0;
+        // Unacked head stays queued and is re-sealed for the next session.
+        self.inflight = None;
         let next_backoff = (prev_backoff * 2).min(30_000); // Max 30 seconds backoff
         self.state = ClientState::Disconnected {
             next_attempt_ms: now_ms + (prev_backoff as u64),
@@ -326,10 +351,11 @@ impl<const OUTBOX_CAP: usize> NetClient<OUTBOX_CAP> {
 
                         self.tx_seq = 1;
                         self.rx_seq = 0;
+                        self.inflight = None;
                         self.rx_buf.copy_within(frame_total_len..self.rx_len, 0);
                         self.rx_len -= frame_total_len;
                         self.state = ClientState::Online;
-                        self.flush_outbox();
+                        self.flush_outbox(now_ms);
                         return;
                     }
                 }
@@ -340,50 +366,59 @@ impl<const OUTBOX_CAP: usize> NetClient<OUTBOX_CAP> {
         }
     }
 
+    /// Alternate between dispatching every complete buffered frame and reading
+    /// more bytes. Because complete frames are consumed before each recv(), the
+    /// buffer never holds more than one partial frame (< MAX_FRAME_LEN), so a
+    /// burst of back-to-back frames can never overflow `rx_buf`.
     fn receive_frames(
         &mut self,
         now_ms: u64,
         can_read_socket: bool,
         on_data: &mut impl FnMut(MsgType, &[u8]),
     ) {
-        if can_read_socket && self.socket.is_open() {
-            loop {
-                if self.rx_len >= self.rx_buf.len() {
+        let mut reads = 0;
+        loop {
+            if !self.dispatch_buffered_frames(now_ms, on_data) {
+                return; // disconnected
+            }
+            if !can_read_socket || !self.socket.is_open() || reads >= MAX_RECV_PER_STEP {
+                return;
+            }
+            reads += 1;
+            match self.socket.recv(&mut self.rx_buf[self.rx_len..]) {
+                Ok(0) => {
                     self.transition_to_disconnected(now_ms, 2000);
                     return;
                 }
-                match self.socket.recv(&mut self.rx_buf[self.rx_len..]) {
-                    Ok(0) => {
-                        self.transition_to_disconnected(now_ms, 2000);
-                        return;
-                    }
-                    Ok(n) => {
-                        self.rx_len += n;
-                    }
-                    Err(err) if err == libc::EAGAIN || err == libc::EWOULDBLOCK => {
-                        break;
-                    }
-                    Err(_) => {
-                        self.transition_to_disconnected(now_ms, 2000);
-                        return;
-                    }
+                Ok(n) => self.rx_len += n,
+                Err(err) if err == libc::EAGAIN || err == libc::EWOULDBLOCK => return,
+                Err(_) => {
+                    self.transition_to_disconnected(now_ms, 2000);
+                    return;
                 }
             }
         }
+    }
 
+    /// Returns `false` if the connection was torn down.
+    fn dispatch_buffered_frames(
+        &mut self,
+        now_ms: u64,
+        on_data: &mut impl FnMut(MsgType, &[u8]),
+    ) -> bool {
         while self.rx_len >= HEADER_LEN {
             let hdr = match FrameHeader::decode(&self.rx_buf[..HEADER_LEN]) {
                 Ok(h) => h,
                 Err(_) => {
                     self.transition_to_disconnected(now_ms, 2000);
-                    return;
+                    return false;
                 }
             };
 
             let frame_total_len = HEADER_LEN + (hdr.payload_len as usize);
             if frame_total_len > MAX_FRAME_LEN || (hdr.payload_len as usize) < TAG_LEN {
                 self.transition_to_disconnected(now_ms, 2000);
-                return;
+                return false;
             }
 
             if self.rx_len < frame_total_len {
@@ -404,8 +439,11 @@ impl<const OUTBOX_CAP: usize> NetClient<OUTBOX_CAP> {
                         self.rx_seq = hdr.seq_num;
                         match hdr.msg_type {
                             MsgType::Ack => {
-                                if let Ok(ack) = AckPayload::decode(pt) {
-                                    self.outbox.ack(ack.acked_seq);
+                                if let (Ok(ack), Some(f)) = (AckPayload::decode(pt), self.inflight) {
+                                    if ack.acked_seq == f.seq {
+                                        self.outbox.pop();
+                                        self.inflight = None;
+                                    }
                                 }
                             }
                             MsgType::Data | MsgType::AuthResp => {
@@ -417,18 +455,51 @@ impl<const OUTBOX_CAP: usize> NetClient<OUTBOX_CAP> {
                 }
                 Err(_) => {
                     self.transition_to_disconnected(now_ms, 2000);
-                    return;
+                    return false;
                 }
             }
 
             self.rx_buf.copy_within(frame_total_len..self.rx_len, 0);
             self.rx_len -= frame_total_len;
         }
+        true
     }
 
-    fn flush_outbox(&mut self) {
-        if let Some((_seq, frame)) = self.outbox.peek() {
-            let _ = self.socket.send(frame);
+    /// Seal the outbox head with the *current* session and write it, unless an
+    /// event is already in flight (stop-and-wait: one unacked frame at a time).
+    fn flush_outbox(&mut self, now_ms: u64) {
+        if self.inflight.is_some() || !self.socket.is_open() {
+            return;
+        }
+        let Some((msg_type, plaintext)) = self.outbox.peek() else {
+            return;
+        };
+
+        let seq = self.tx_seq;
+        let mut frame = [0u8; MAX_FRAME_LEN];
+        let Ok(len) = pack_and_encrypt(
+            &self.session_key,
+            &self.session_salt,
+            msg_type,
+            self.session_id,
+            seq,
+            plaintext,
+            &mut frame,
+        ) else {
+            // Unreachable: Outbox::push enforces MAX_EVENT_LEN. Drop rather than wedge the queue.
+            self.outbox.pop();
+            return;
+        };
+
+        match self.socket.send(&frame[..len]) {
+            Ok(n) if n == len => {
+                self.tx_seq = self.tx_seq.wrapping_add(1);
+                self.inflight = Some(Inflight { seq, sent_ms: now_ms });
+            }
+            // Socket buffer full: nothing written, retry when wants_write() -> POLLOUT fires.
+            Err(e) if e == libc::EAGAIN || e == libc::EWOULDBLOCK => {}
+            // Short write (stream now desynced) or hard error: reconnect, event stays queued.
+            _ => self.transition_to_disconnected(now_ms, 2000),
         }
     }
 }
@@ -1035,5 +1106,167 @@ mod tests {
         assert!(client.send_data(b"MSG_3").is_ok());
         assert_eq!(client.outbox_pending_count(), 2);
         assert_eq!(client.status(), NetworkStatus::Syncing(2));
+    }
+
+    #[test]
+    fn test_offline_enqueued_events_survive_and_flush_on_connect() {
+        let psk = [0x78u8; 32];
+        let uuid = [0x56u8; 16];
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+
+        let mut client: NetClient<4> = NetClient::new(psk, uuid, [127, 0, 0, 1], port);
+
+        // Enqueue 2 events while completely offline
+        assert_eq!(client.status(), NetworkStatus::Offline);
+        client.send_data(b"OFFLINE_EVENT_1").unwrap();
+        client.send_data(b"OFFLINE_EVENT_2").unwrap();
+        assert_eq!(client.outbox_pending_count(), 2);
+
+        // Drive connection
+        let mut now_ms = 1000u64;
+        client.poll_step(now_ms, 0);
+
+        let mut server_stream = loop {
+            match listener.accept() {
+                Ok((s, _)) => break s,
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(e) => panic!("Accept error: {:?}", e),
+            }
+        };
+        server_stream.set_nonblocking(true).unwrap();
+        server_stream.set_nodelay(true).unwrap();
+
+        // Step client with POLLOUT -> HandshakeInit
+        now_ms += 10;
+        client.poll_step(now_ms, libc::POLLOUT);
+        assert_eq!(client.status(), NetworkStatus::Handshaking);
+
+        let mut init_buf = [0u8; MAX_FRAME_LEN];
+        let n = read_exact_frame(&mut server_stream, &mut init_buf);
+        let (_hdr, init_pt) = verify_and_unpack_hmac(&psk, &init_buf[..n]).unwrap();
+        let init_payload = HandshakeInitPayload::decode(init_pt).unwrap();
+
+        // Send HandshakeResp
+        let server_nonce = crate::crypto::sha256(b"SRV_NONCE");
+        let session_id = 999;
+        let session_salt = [1, 2, 3, 4];
+        let resp_payload = HandshakeRespPayload {
+            server_nonce,
+            assigned_session_id: session_id,
+            session_salt,
+        };
+        let mut resp_pt = [0u8; HandshakeRespPayload::LEN];
+        resp_payload.encode(&mut resp_pt).unwrap();
+        let mut resp_frame = [0u8; MAX_FRAME_LEN];
+        let resp_len = pack_and_authenticate_hmac(
+            &psk,
+            MsgType::HandshakeResp,
+            session_id,
+            0,
+            &resp_pt,
+            &mut resp_frame,
+        ).unwrap();
+        server_stream.write_all(&resp_frame[..resp_len]).unwrap();
+
+        // Step client -> completes handshake, becomes Online, and flushes OFFLINE_EVENT_1!
+        now_ms += 10;
+        client.poll_step(now_ms, libc::POLLIN);
+        assert_eq!(client.status(), NetworkStatus::Syncing(2));
+
+        let session_key = derive_session_key(
+            &psk,
+            &session_salt,
+            &init_payload.client_nonce,
+            &server_nonce,
+        );
+
+        // Server receives OFFLINE_EVENT_1
+        let mut buf = [0u8; MAX_FRAME_LEN];
+        let n1 = read_exact_frame(&mut server_stream, &mut buf);
+        let (hdr1, pt1) = decrypt_and_unpack(&session_key, &session_salt, &mut buf[..n1]).unwrap();
+        assert_eq!(hdr1.seq_num, 1);
+        assert_eq!(pt1, b"OFFLINE_EVENT_1");
+
+        // Server ACKs seq 1
+        let ack1 = AckPayload { acked_seq: 1, status: 0 };
+        let mut ack1_pt = [0u8; AckPayload::LEN];
+        ack1.encode(&mut ack1_pt).unwrap();
+        let mut ack1_frame = [0u8; MAX_FRAME_LEN];
+        let ack1_len = pack_and_encrypt(
+            &session_key,
+            &session_salt,
+            MsgType::Ack,
+            session_id,
+            1,
+            &ack1_pt,
+            &mut ack1_frame,
+        ).unwrap();
+        server_stream.write_all(&ack1_frame[..ack1_len]).unwrap();
+
+        // Step client -> processes ACK for seq 1, pops EVENT_1, and flushes EVENT_2 (seq 2)
+        now_ms += 10;
+        let _ = step_loopback(&mut client, now_ms, |_, _| {});
+        assert_eq!(client.outbox_pending_count(), 1);
+
+        // Server receives OFFLINE_EVENT_2
+        let n2 = read_exact_frame(&mut server_stream, &mut buf);
+        let (hdr2, pt2) = decrypt_and_unpack(&session_key, &session_salt, &mut buf[..n2]).unwrap();
+        assert_eq!(hdr2.seq_num, 2);
+        assert_eq!(pt2, b"OFFLINE_EVENT_2");
+
+        // Server ACKs seq 2
+        let ack2 = AckPayload { acked_seq: 2, status: 0 };
+        let mut ack2_pt = [0u8; AckPayload::LEN];
+        ack2.encode(&mut ack2_pt).unwrap();
+        let mut ack2_frame = [0u8; MAX_FRAME_LEN];
+        let ack2_len = pack_and_encrypt(
+            &session_key,
+            &session_salt,
+            MsgType::Ack,
+            session_id,
+            2,
+            &ack2_pt,
+            &mut ack2_frame,
+        ).unwrap();
+        server_stream.write_all(&ack2_frame[..ack2_len]).unwrap();
+
+        // Step client -> processes ACK for seq 2, pops EVENT_2
+        now_ms += 10;
+        let _ = step_loopback(&mut client, now_ms, |_, _| {});
+        assert_eq!(client.outbox_pending_count(), 0);
+        assert_eq!(client.status(), NetworkStatus::Online);
+    }
+
+    #[test]
+    fn test_ack_timeout_triggers_disconnect_and_retains_head() {
+        let psk = [0x89u8; 32];
+        let uuid = [0xABu8; 16];
+        let (mut client, mut server_stream, session_key, session_salt, _session_id, mut now_ms) =
+            establish_online_session::<4>(psk, uuid);
+
+        client.send_data(b"UNACKED_DATA").unwrap();
+        now_ms += 10;
+        let _ = step_loopback(&mut client, now_ms, |_, _| {});
+
+        // Server reads frame but does NOT ACK
+        let mut buf = [0u8; MAX_FRAME_LEN];
+        let n = read_exact_frame(&mut server_stream, &mut buf);
+        let (hdr, _) = decrypt_and_unpack(&session_key, &session_salt, &mut buf[..n]).unwrap();
+        assert_eq!(hdr.seq_num, 1);
+
+        // Advance monotonic time by ACK_TIMEOUT_MS
+        now_ms += ACK_TIMEOUT_MS + 100;
+        let _ = step_loopback(&mut client, now_ms, |_, _| {});
+
+        // Must have detected timeout and transitioned to Offline, closing socket
+        assert_eq!(client.status(), NetworkStatus::Offline);
+        assert_eq!(client.socket_fd(), -1);
+        // The unacknowledged frame must still be retained in outbox!
+        assert_eq!(client.outbox_pending_count(), 1);
     }
 }

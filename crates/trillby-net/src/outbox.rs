@@ -1,9 +1,20 @@
 //! Offline Resilient Outbox Queue
 //!
-//! Fixed-capacity zero-allocation ring buffer storing encrypted binary frames
+//! Fixed-capacity zero-allocation ring buffer storing *plaintext* events
 //! awaiting server acknowledgement.
+//!
+//! Events are deliberately NOT sealed at enqueue time: the session key,
+//! session id and sequence number only exist once a handshake completes, and
+//! all three change on every reconnect. `NetClient` encrypts the head event
+//! with the *current* session right before transmitting it, so events queued
+//! while offline (or left unacknowledged when a link drops) are always
+//! deliverable on the next session.
 
-use crate::packet::MAX_FRAME_LEN;
+use crate::packet::{MsgType, MAX_PAYLOAD_LEN, TAG_LEN};
+
+/// Largest plaintext that still fits in one frame after the AEAD tag.
+pub const MAX_EVENT_LEN: usize = MAX_PAYLOAD_LEN as usize - TAG_LEN;
+const _: () = assert!(MAX_EVENT_LEN <= u8::MAX as usize);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutboxError {
@@ -12,24 +23,24 @@ pub enum OutboxError {
 }
 
 #[derive(Clone, Copy)]
-pub struct QueuedFrame {
-    pub seq_num: u32,
-    pub len: u16,
-    pub data: [u8; MAX_FRAME_LEN],
+pub struct QueuedEvent {
+    pub msg_type: MsgType,
+    pub len: u8,
+    pub data: [u8; MAX_EVENT_LEN],
 }
 
-impl QueuedFrame {
+impl QueuedEvent {
     pub const fn empty() -> Self {
         Self {
-            seq_num: 0,
+            msg_type: MsgType::Data,
             len: 0,
-            data: [0u8; MAX_FRAME_LEN],
+            data: [0u8; MAX_EVENT_LEN],
         }
     }
 }
 
 pub struct Outbox<const CAP: usize> {
-    frames: [QueuedFrame; CAP],
+    events: [QueuedEvent; CAP],
     head: usize,
     tail: usize,
     count: usize,
@@ -38,7 +49,7 @@ pub struct Outbox<const CAP: usize> {
 impl<const CAP: usize> Outbox<CAP> {
     pub const fn new() -> Self {
         Self {
-            frames: [QueuedFrame::empty(); CAP],
+            events: [QueuedEvent::empty(); CAP],
             head: 0,
             tail: 0,
             count: 0,
@@ -61,48 +72,43 @@ impl<const CAP: usize> Outbox<CAP> {
         CAP
     }
 
-    /// Enqueue an encrypted frame.
-    pub fn push(&mut self, seq_num: u32, frame: &[u8]) -> Result<(), OutboxError> {
+    /// Enqueue a plaintext event.
+    pub fn push(&mut self, msg_type: MsgType, plaintext: &[u8]) -> Result<(), OutboxError> {
+        if plaintext.len() > MAX_EVENT_LEN {
+            return Err(OutboxError::FrameTooLarge);
+        }
         if self.count >= CAP {
             return Err(OutboxError::Full);
         }
-        if frame.len() > MAX_FRAME_LEN {
-            return Err(OutboxError::FrameTooLarge);
-        }
 
-        let slot = &mut self.frames[self.tail];
-        slot.seq_num = seq_num;
-        slot.len = frame.len() as u16;
-        slot.data[..frame.len()].copy_from_slice(frame);
+        let slot = &mut self.events[self.tail];
+        slot.msg_type = msg_type;
+        slot.len = plaintext.len() as u8;
+        slot.data[..plaintext.len()].copy_from_slice(plaintext);
 
         self.tail = (self.tail + 1) % CAP;
         self.count += 1;
         Ok(())
     }
 
-    /// Inspect the oldest unacknowledged frame at the head of the queue.
-    pub fn peek(&self) -> Option<(u32, &[u8])> {
+    /// Inspect the oldest unacknowledged event at the head of the queue.
+    pub fn peek(&self) -> Option<(MsgType, &[u8])> {
         if self.count == 0 {
             None
         } else {
-            let slot = &self.frames[self.head];
-            Some((slot.seq_num, &slot.data[..slot.len as usize]))
+            let slot = &self.events[self.head];
+            Some((slot.msg_type, &slot.data[..slot.len as usize]))
         }
     }
 
-    /// Acknowledge and remove the head frame if `seq_num` matches or is ahead.
-    pub fn ack(&mut self, seq_num: u32) -> bool {
+    /// Remove the head event (after the server acknowledged it).
+    pub fn pop(&mut self) -> bool {
         if self.count == 0 {
             return false;
         }
-        let head_slot = &self.frames[self.head];
-        if head_slot.seq_num <= seq_num {
-            self.head = (self.head + 1) % CAP;
-            self.count -= 1;
-            true
-        } else {
-            false
-        }
+        self.head = (self.head + 1) % CAP;
+        self.count -= 1;
+        true
     }
 
     pub fn clear(&mut self) {
@@ -121,34 +127,51 @@ mod tests {
         let mut outbox: Outbox<4> = Outbox::new();
         assert!(outbox.is_empty());
 
-        assert!(outbox.push(1, b"FRAME_1").is_ok());
-        assert!(outbox.push(2, b"FRAME_2").is_ok());
-        assert!(outbox.push(3, b"FRAME_3").is_ok());
+        assert!(outbox.push(MsgType::Data, b"EVENT_1").is_ok());
+        assert!(outbox.push(MsgType::AuthInit, b"EVENT_2").is_ok());
+        assert!(outbox.push(MsgType::Heartbeat, b"EVENT_3").is_ok());
         assert_eq!(outbox.len(), 3);
 
         // Peek head
-        let (seq, data) = outbox.peek().unwrap();
-        assert_eq!(seq, 1);
-        assert_eq!(data, b"FRAME_1");
+        let (ty, data) = outbox.peek().unwrap();
+        assert_eq!(ty, MsgType::Data);
+        assert_eq!(data, b"EVENT_1");
 
-        // Ack frame 1
-        assert!(outbox.ack(1));
+        // Pop event 1
+        assert!(outbox.pop());
         assert_eq!(outbox.len(), 2);
 
-        // Next peek should be frame 2
-        let (seq2, data2) = outbox.peek().unwrap();
-        assert_eq!(seq2, 2);
-        assert_eq!(data2, b"FRAME_2");
+        // Next peek should be event 2
+        let (ty2, data2) = outbox.peek().unwrap();
+        assert_eq!(ty2, MsgType::AuthInit);
+        assert_eq!(data2, b"EVENT_2");
 
-        // Ack frame 2
-        assert!(outbox.ack(2));
+        // Pop event 2
+        assert!(outbox.pop());
         assert_eq!(outbox.len(), 1);
 
-        // Push until full
-        assert!(outbox.push(4, b"FRAME_4").is_ok());
-        assert!(outbox.push(5, b"FRAME_5").is_ok());
-        assert!(outbox.push(6, b"FRAME_6").is_ok());
+        // Push until full (exercises ring wrap-around)
+        assert!(outbox.push(MsgType::Data, b"EVENT_4").is_ok());
+        assert!(outbox.push(MsgType::Data, b"EVENT_5").is_ok());
+        assert!(outbox.push(MsgType::Data, b"EVENT_6").is_ok());
         assert!(outbox.is_full());
-        assert_eq!(outbox.push(7, b"FRAME_7"), Err(OutboxError::Full));
+        assert_eq!(outbox.push(MsgType::Data, b"EVENT_7"), Err(OutboxError::Full));
+
+        // FIFO order preserved across wrap
+        for expected in [&b"EVENT_3"[..], b"EVENT_4", b"EVENT_5", b"EVENT_6"] {
+            assert_eq!(outbox.peek().unwrap().1, expected);
+            assert!(outbox.pop());
+        }
+        assert!(!outbox.pop());
+    }
+
+    #[test]
+    fn test_outbox_rejects_oversized_event() {
+        let mut outbox: Outbox<2> = Outbox::new();
+        assert!(outbox.push(MsgType::Data, &[0u8; MAX_EVENT_LEN]).is_ok());
+        assert_eq!(
+            outbox.push(MsgType::Data, &[0u8; MAX_EVENT_LEN + 1]),
+            Err(OutboxError::FrameTooLarge)
+        );
     }
 }

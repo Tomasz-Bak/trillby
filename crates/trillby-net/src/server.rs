@@ -11,6 +11,8 @@ use crate::packet::{
 };
 use crate::posix::PosixSocket;
 
+const MAX_RECV_PER_STEP: usize = 16;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServerSessionState {
     Handshaking,
@@ -504,26 +506,37 @@ impl<const MAX_CLIENTS: usize> NetServer<MAX_CLIENTS> {
         Ok(Some((init_payload.device_uuid, assigned_session_id)))
     }
 
+    /// Alternate between dispatching every complete buffered frame and reading
+    /// more bytes. Complete frames are consumed before each recv(), so the
+    /// buffer never holds more than one partial frame and cannot overflow no
+    /// matter how many frames a client sends back-to-back.
     fn handle_session_online(
         session: &mut ServerSession,
         has_in: bool,
         client_idx: usize,
         on_event: &mut impl FnMut(ServerEvent),
     ) -> Result<(), ()> {
-        if has_in && session.socket.is_open() {
-            loop {
-                if session.rx_len >= session.rx_buf.len() {
-                    return Err(());
-                }
-                match session.socket.recv(&mut session.rx_buf[session.rx_len..]) {
-                    Ok(0) => return Err(()), // Closed by peer
-                    Ok(n) => session.rx_len += n,
-                    Err(err) if err == libc::EAGAIN || err == libc::EWOULDBLOCK => break,
-                    Err(_) => return Err(()),
-                }
+        let mut reads = 0;
+        loop {
+            Self::dispatch_session_frames(session, client_idx, on_event)?;
+            if !has_in || !session.socket.is_open() || reads >= MAX_RECV_PER_STEP {
+                return Ok(());
+            }
+            reads += 1;
+            match session.socket.recv(&mut session.rx_buf[session.rx_len..]) {
+                Ok(0) => return Err(()), // Closed by peer
+                Ok(n) => session.rx_len += n,
+                Err(err) if err == libc::EAGAIN || err == libc::EWOULDBLOCK => return Ok(()),
+                Err(_) => return Err(()),
             }
         }
+    }
 
+    fn dispatch_session_frames(
+        session: &mut ServerSession,
+        client_idx: usize,
+        on_event: &mut impl FnMut(ServerEvent),
+    ) -> Result<(), ()> {
         while session.rx_len >= HEADER_LEN {
             let hdr = match FrameHeader::decode(&session.rx_buf[..HEADER_LEN]) {
                 Ok(h) => h,

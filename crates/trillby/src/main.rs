@@ -222,7 +222,7 @@ fn run_app() {
         let mut net_poll_idx: i32 = -1;
         if net_fd >= 0 {
             let mut events = libc::POLLIN;
-            if net_client.state() == trillby_net::ClientState::Connecting || net_client.outbox_pending_count() > 0 {
+            if net_client.wants_write() {
                 events |= libc::POLLOUT;
             }
             net_poll_idx = poll_count as i32;
