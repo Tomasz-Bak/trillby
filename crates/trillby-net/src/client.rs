@@ -9,8 +9,8 @@ use crate::outbox::{Outbox, OutboxError};
 use crate::packet::{
     decrypt_and_unpack, derive_session_key, generate_client_nonce, pack_and_authenticate_hmac,
     pack_and_encrypt, verify_and_unpack_hmac, AckPayload, AuthInitPayload, FrameHeader,
-    HandshakeInitPayload, HandshakeRespPayload, HeartbeatPayload, MsgType, HEADER_LEN,
-    HMAC_TAG_LEN, MAX_FRAME_LEN, TAG_LEN,
+    HandshakeInitPayload, HandshakeRespPayload, HeartbeatPayload, MsgType, WorkEventPayload,
+    HEADER_LEN, HMAC_TAG_LEN, MAX_FRAME_LEN, TAG_LEN,
 };
 use crate::posix::PosixSocket;
 use trillby_core::net_types::NetworkStatus;
@@ -134,6 +134,13 @@ impl<const OUTBOX_CAP: usize> NetClient<OUTBOX_CAP> {
     /// Enqueue an application data payload (MsgType::Data) for transmission.
     pub fn send_data(&mut self, data: &[u8]) -> Result<(), OutboxError> {
         self.enqueue_event(MsgType::Data, data)
+    }
+
+    /// Enqueue a structured work/session event payload (MsgType::Data) for transmission.
+    pub fn send_work_event(&mut self, payload: &WorkEventPayload) -> Result<(), OutboxError> {
+        let mut buf = [0u8; WorkEventPayload::LEN];
+        payload.encode(&mut buf).map_err(|_| OutboxError::FrameTooLarge)?;
+        self.enqueue_event(MsgType::Data, &buf)
     }
 
     /// Enqueue an authentication request payload (MsgType::AuthInit) for transmission.

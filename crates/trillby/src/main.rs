@@ -59,7 +59,7 @@ use embedded_graphics::{
 use embedded_graphics_framebuf::FrameBuf;
 use fb::FramebufferWriter;
 use trillby_core::{
-    Point as CorePoint, UiEvent, UiState, POLL_TIMEOUT_MS,
+    Point as CorePoint, SessionEvent, UiEvent, UiState, POLL_TIMEOUT_MS,
 };
 use trillby_ui::{
     eg_rect_to_core, KeyboardGrid, LayoutZones, UiRenderer,
@@ -262,24 +262,17 @@ fn run_app() {
                                             let trimmed = line.trim();
                                             if let Some(rest) = trimmed.strip_prefix("rfid ") {
                                                 if let Ok(id) = heapless::String::try_from(rest) {
-                                                    state.handle_event(UiEvent::RfidScanned(id.clone()), core_bounds, core_kb_bounds, None);
-                                                    let mut payload = trillby_net::AuthInitPayload {
-                                                        auth_data_len: id.len().min(32) as u8,
-                                                        auth_data: [0u8; 32],
-                                                        timestamp_ms: now_ms,
-                                                    };
-                                                    payload.auth_data[..id.len().min(32)].copy_from_slice(id.as_bytes());
-                                                    let _ = net_client.send_auth(&payload);
+                                                    state.handle_event(UiEvent::RfidScanned(id), core_bounds, core_kb_bounds, None);
                                                 }
                                             } else if let Some(rest) = trimmed.strip_prefix("barcode ") {
                                                 if let Ok(data) = heapless::String::try_from(rest) {
-                                                    state.handle_event(UiEvent::BarcodeScanned(data.clone()), core_bounds, core_kb_bounds, None);
-                                                    let _ = net_client.send_data(data.as_bytes());
-                                                }
-                                            } else if let Some(rest) = trimmed.strip_prefix("type ") {
-                                                if let Ok(data) = heapless::String::try_from(rest) {
                                                     state.handle_event(UiEvent::BarcodeScanned(data), core_bounds, core_kb_bounds, None);
                                                 }
+                                            } else if let Some(rest) = trimmed.strip_prefix("type ") {
+                                                for c in rest.chars() {
+                                                    state.apply_key(trillby_core::Key::Char(c));
+                                                }
+                                                state.dirty = true;
                                             } else if let Some(rest) = trimmed.strip_prefix("click ") {
                                                 let mut parts = rest.split_whitespace();
                                                 if let (Some(x_str), Some(y_str)) = (parts.next(), parts.next()) {
@@ -370,6 +363,50 @@ fn run_app() {
                 let key = zones.keyboard_area.and_then(|kb| KeyboardGrid::resolve_key(kb, eg_pt, state.keyboard_layer));
                 state.handle_event(UiEvent::TouchMove { scaled: core_pt, raw: (raw_x, raw_y) }, core_bounds, core_kb_bounds, key);
                 touch_moved = false;
+            }
+        }
+
+        // Drain pending session events generated during UI event handling into network outbox
+        while let Some(ev) = state.pop_session_event() {
+            match ev {
+                SessionEvent::OperatorLogin { operator_id, .. } => {
+                    let op_bytes = operator_id.as_bytes();
+                    let len = op_bytes.len().min(32);
+                    let mut payload = trillby_net::AuthInitPayload {
+                        auth_data_len: len as u8,
+                        auth_data: [0u8; 32],
+                        timestamp_ms: now_ms,
+                    };
+                    payload.auth_data[..len].copy_from_slice(&op_bytes[..len]);
+                    let _ = net_client.send_auth(&payload);
+                }
+                SessionEvent::OperatorLogout { operator_id, .. } => {
+                    let _ = net_client.send_work_event(
+                        &trillby_net::WorkEventPayload::operator_logout(
+                            operator_id.as_bytes(),
+                            now_ms,
+                        ),
+                    );
+                }
+                SessionEvent::WorkStart { operator_id, job_id, .. } => {
+                    let _ = net_client.send_work_event(
+                        &trillby_net::WorkEventPayload::work_start(
+                            operator_id.as_bytes(),
+                            job_id.as_bytes(),
+                            now_ms,
+                        ),
+                    );
+                }
+                SessionEvent::WorkStop { operator_id, job_id, duration_ms, .. } => {
+                    let _ = net_client.send_work_event(
+                        &trillby_net::WorkEventPayload::work_stop(
+                            operator_id.as_bytes(),
+                            job_id.as_bytes(),
+                            now_ms,
+                            duration_ms,
+                        ),
+                    );
+                }
             }
         }
 

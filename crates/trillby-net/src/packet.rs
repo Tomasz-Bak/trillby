@@ -460,6 +460,139 @@ impl AckPayload {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum WorkEventKind {
+    WorkStart = 0x01,
+    WorkStop = 0x02,
+    OperatorLogout = 0x03,
+}
+
+impl TryFrom<u8> for WorkEventKind {
+    type Error = PacketError;
+
+    fn try_from(val: u8) -> Result<Self, Self::Error> {
+        match val {
+            0x01 => Ok(WorkEventKind::WorkStart),
+            0x02 => Ok(WorkEventKind::WorkStop),
+            0x03 => Ok(WorkEventKind::OperatorLogout),
+            _ => Err(PacketError::InvalidPayload),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkEventPayload {
+    pub kind: WorkEventKind,
+    pub operator_id_len: u8,
+    pub operator_id: [u8; 32],
+    pub job_id_len: u8,
+    pub job_id: [u8; 64],
+    pub timestamp_ms: u64,
+    pub duration_ms: u64,
+}
+
+impl WorkEventPayload {
+    pub const LEN: usize = 115; // 1 + 1 + 32 + 1 + 64 + 8 + 8
+
+    pub fn work_start(operator_id: &[u8], job_id: &[u8], timestamp_ms: u64) -> Self {
+        let op_len = operator_id.len().min(32);
+        let mut op_buf = [0u8; 32];
+        op_buf[..op_len].copy_from_slice(&operator_id[..op_len]);
+
+        let job_len = job_id.len().min(64);
+        let mut job_buf = [0u8; 64];
+        job_buf[..job_len].copy_from_slice(&job_id[..job_len]);
+
+        Self {
+            kind: WorkEventKind::WorkStart,
+            operator_id_len: op_len as u8,
+            operator_id: op_buf,
+            job_id_len: job_len as u8,
+            job_id: job_buf,
+            timestamp_ms,
+            duration_ms: 0,
+        }
+    }
+
+    pub fn work_stop(operator_id: &[u8], job_id: &[u8], timestamp_ms: u64, duration_ms: u64) -> Self {
+        let op_len = operator_id.len().min(32);
+        let mut op_buf = [0u8; 32];
+        op_buf[..op_len].copy_from_slice(&operator_id[..op_len]);
+
+        let job_len = job_id.len().min(64);
+        let mut job_buf = [0u8; 64];
+        job_buf[..job_len].copy_from_slice(&job_id[..job_len]);
+
+        Self {
+            kind: WorkEventKind::WorkStop,
+            operator_id_len: op_len as u8,
+            operator_id: op_buf,
+            job_id_len: job_len as u8,
+            job_id: job_buf,
+            timestamp_ms,
+            duration_ms,
+        }
+    }
+
+    pub fn operator_logout(operator_id: &[u8], timestamp_ms: u64) -> Self {
+        let op_len = operator_id.len().min(32);
+        let mut op_buf = [0u8; 32];
+        op_buf[..op_len].copy_from_slice(&operator_id[..op_len]);
+
+        Self {
+            kind: WorkEventKind::OperatorLogout,
+            operator_id_len: op_len as u8,
+            operator_id: op_buf,
+            job_id_len: 0,
+            job_id: [0u8; 64],
+            timestamp_ms,
+            duration_ms: 0,
+        }
+    }
+
+    pub fn encode(&self, out: &mut [u8]) -> Result<(), PacketError> {
+        let mut w = ByteWriter::new(out);
+        w.write_u8(self.kind as u8)?;
+        w.write_u8(self.operator_id_len)?;
+        w.write_bytes(&self.operator_id)?;
+        w.write_u8(self.job_id_len)?;
+        w.write_bytes(&self.job_id)?;
+        w.write_u64_le(self.timestamp_ms)?;
+        w.write_u64_le(self.duration_ms)?;
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, PacketError> {
+        if bytes.len() != Self::LEN {
+            return Err(PacketError::InvalidPayload);
+        }
+        let mut r = ByteReader::new(bytes);
+        let kind = WorkEventKind::try_from(r.read_u8()?)?;
+        let operator_id_len = r.read_u8()?;
+        if operator_id_len > 32 {
+            return Err(PacketError::InvalidPayload);
+        }
+        let operator_id = r.read_array::<32>()?;
+        let job_id_len = r.read_u8()?;
+        if job_id_len > 64 {
+            return Err(PacketError::InvalidPayload);
+        }
+        let job_id = r.read_array::<64>()?;
+        let timestamp_ms = r.read_u64_le()?;
+        let duration_ms = r.read_u64_le()?;
+        Ok(Self {
+            kind,
+            operator_id_len,
+            operator_id,
+            job_id_len,
+            job_id,
+            timestamp_ms,
+            duration_ms,
+        })
+    }
+}
+
 // ===========================================================================
 // Key Derivation & Nonce Helpers
 // ===========================================================================
@@ -864,6 +997,101 @@ mod tests {
         assert_eq!(
             verify_and_unpack_hmac(&key, &tampered_tag[..len]),
             Err(PacketError::AuthenticationFailed)
+        );
+    }
+
+    #[test]
+    fn test_work_event_payload_round_trip_and_clamping() {
+        let start = WorkEventPayload::work_start(b"OP-0042", b"WO-55102", 123_456);
+        assert_eq!(start.kind, WorkEventKind::WorkStart);
+        assert_eq!(start.operator_id_len, 7);
+        assert_eq!(&start.operator_id[..7], b"OP-0042");
+        assert_eq!(start.job_id_len, 8);
+        assert_eq!(&start.job_id[..8], b"WO-55102");
+        assert_eq!(start.timestamp_ms, 123_456);
+        assert_eq!(start.duration_ms, 0);
+
+        let mut buf = [0u8; WorkEventPayload::LEN];
+        start.encode(&mut buf).unwrap();
+        assert_eq!(WorkEventPayload::decode(&buf).unwrap(), start);
+
+        let stop = WorkEventPayload::work_stop(b"OP-0042", b"WO-55102", 223_456, 100_000);
+        assert_eq!(stop.kind, WorkEventKind::WorkStop);
+        assert_eq!(stop.duration_ms, 100_000);
+        stop.encode(&mut buf).unwrap();
+        assert_eq!(WorkEventPayload::decode(&buf).unwrap(), stop);
+
+        let logout = WorkEventPayload::operator_logout(b"OP-0042", 250_000);
+        assert_eq!(logout.kind, WorkEventKind::OperatorLogout);
+        assert_eq!(logout.job_id_len, 0);
+        assert_eq!(logout.duration_ms, 0);
+        logout.encode(&mut buf).unwrap();
+        assert_eq!(WorkEventPayload::decode(&buf).unwrap(), logout);
+
+        // Over-length operator_id (> 32) and job_id (> 64) are clamped
+        let long_op = [b'A'; 40];
+        let long_job = [b'B'; 80];
+        let clamped = WorkEventPayload::work_start(&long_op, &long_job, 999);
+        assert_eq!(clamped.operator_id_len, 32);
+        assert_eq!(clamped.operator_id, [b'A'; 32]);
+        assert_eq!(clamped.job_id_len, 64);
+        assert_eq!(clamped.job_id, [b'B'; 64]);
+        clamped.encode(&mut buf).unwrap();
+        assert_eq!(WorkEventPayload::decode(&buf).unwrap(), clamped);
+    }
+
+    #[test]
+    fn test_work_event_payload_validation_errors() {
+        let valid = WorkEventPayload::work_start(b"OP-1", b"JOB-1", 1000);
+        let mut buf = [0u8; WorkEventPayload::LEN];
+        valid.encode(&mut buf).unwrap();
+
+        // Buffer length mismatch on decode
+        assert_eq!(
+            WorkEventPayload::decode(&buf[..WorkEventPayload::LEN - 1]),
+            Err(PacketError::InvalidPayload)
+        );
+        let mut oversized = [0u8; WorkEventPayload::LEN + 1];
+        oversized[..WorkEventPayload::LEN].copy_from_slice(&buf);
+        assert_eq!(
+            WorkEventPayload::decode(&oversized),
+            Err(PacketError::InvalidPayload)
+        );
+
+        // Unknown WorkEventKind discriminant
+        let mut bad_kind = buf;
+        bad_kind[0] = 0x00;
+        assert_eq!(
+            WorkEventPayload::decode(&bad_kind),
+            Err(PacketError::InvalidPayload)
+        );
+        bad_kind[0] = 0x04;
+        assert_eq!(
+            WorkEventPayload::decode(&bad_kind),
+            Err(PacketError::InvalidPayload)
+        );
+
+        // operator_id_len > 32
+        let mut bad_op_len = buf;
+        bad_op_len[1] = 33;
+        assert_eq!(
+            WorkEventPayload::decode(&bad_op_len),
+            Err(PacketError::InvalidPayload)
+        );
+
+        // job_id_len > 64 (offset 1 + 1 + 32 = 34)
+        let mut bad_job_len = buf;
+        bad_job_len[34] = 65;
+        assert_eq!(
+            WorkEventPayload::decode(&bad_job_len),
+            Err(PacketError::InvalidPayload)
+        );
+
+        // BufferTooShort on encode
+        let mut short_out = [0u8; WorkEventPayload::LEN - 1];
+        assert_eq!(
+            valid.encode(&mut short_out),
+            Err(PacketError::BufferTooShort)
         );
     }
 }

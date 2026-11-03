@@ -10,7 +10,10 @@ use std::io::Write;
 use std::net::Ipv4Addr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use trillby_net::{AuthInitPayload, HeartbeatPayload, MsgType, NetServer, ServerEvent};
+use trillby_net::{
+    AuthInitPayload, HeartbeatPayload, MsgType, NetServer, ServerEvent, WorkEventKind,
+    WorkEventPayload,
+};
 
 const MAX_CLIENTS: usize = 32;
 const MAX_DEVICES: usize = 256;
@@ -149,6 +152,45 @@ fn log_event(
                     )?,
                     Err(_) => {
                         out.write_all(b"malformed=")?;
+                        bytes(out, payload)?;
+                    }
+                }
+            }
+            MsgType::Data if payload.len() == WorkEventPayload::LEN => {
+                match WorkEventPayload::decode(payload) {
+                    Ok(w) => {
+                        let op_len = (w.operator_id_len as usize).min(w.operator_id.len());
+                        let job_len = (w.job_id_len as usize).min(w.job_id.len());
+                        let op = &w.operator_id[..op_len];
+                        let job = &w.job_id[..job_len];
+                        match w.kind {
+                            WorkEventKind::WorkStart => {
+                                write!(out, "WORK_START client={client_idx} operator=")?;
+                                bytes(out, op)?;
+                                out.write_all(b" job=")?;
+                                bytes(out, job)?;
+                                write!(out, " device_ts_ms={}", w.timestamp_ms)?;
+                            }
+                            WorkEventKind::WorkStop => {
+                                write!(out, "WORK_STOP  client={client_idx} operator=")?;
+                                bytes(out, op)?;
+                                out.write_all(b" job=")?;
+                                bytes(out, job)?;
+                                write!(
+                                    out,
+                                    " duration_ms={} device_ts_ms={}",
+                                    w.duration_ms, w.timestamp_ms
+                                )?;
+                            }
+                            WorkEventKind::OperatorLogout => {
+                                write!(out, "LOGOUT     client={client_idx} operator=")?;
+                                bytes(out, op)?;
+                                write!(out, " device_ts_ms={}", w.timestamp_ms)?;
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        write!(out, "DATA       client={client_idx} type={msg_type:?} len={} ", payload.len())?;
                         bytes(out, payload)?;
                     }
                 }

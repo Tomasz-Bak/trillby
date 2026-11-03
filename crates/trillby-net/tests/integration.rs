@@ -1,5 +1,6 @@
 use trillby_net::{
     AuthInitPayload, AuthRespPayload, ClientState, MsgType, NetClient, NetServer, ServerEvent,
+    WorkEventKind, WorkEventPayload,
 };
 use trillby_core::net_types::NetworkStatus;
 
@@ -138,6 +139,63 @@ fn test_end_to_end_handshake_and_work_event_flow() {
     assert!(client_auth_resp);
     assert_eq!(client.outbox_pending_count(), 0);
     assert_eq!(client.status(), NetworkStatus::Online);
+}
+
+#[test]
+fn test_send_work_event_end_to_end() {
+    let psk = [0x42u8; 32];
+    let device_uuid = [0xCCu8; 16];
+
+    let mut server = NetServer::<4>::bind([127, 0, 0, 1], 0).expect("bind NetServer");
+    let port = server.port();
+    let mut client = NetClient::<16>::new(psk, device_uuid, [127, 0, 0, 1], port);
+
+    let mut now_ms = 1000u64;
+    let psk_resolver = |uuid: &[u8; 16]| if *uuid == device_uuid { Some(psk) } else { None };
+
+    for _ in 0..5 {
+        now_ms += 10;
+        step_client(&mut client, now_ms, |_, _| {});
+        server.step(now_ms, psk_resolver, |_| {});
+    }
+    assert_eq!(client.status(), NetworkStatus::Online);
+
+    // Enqueue WorkStart, WorkStop, and OperatorLogout
+    let ev_start = WorkEventPayload::work_start(b"OP-0042", b"WO-55102", 1100);
+    let ev_stop = WorkEventPayload::work_stop(b"OP-0042", b"WO-55102", 4600, 3500);
+    let ev_logout = WorkEventPayload::operator_logout(b"OP-0042", 4700);
+
+    client.send_work_event(&ev_start).unwrap();
+    client.send_work_event(&ev_stop).unwrap();
+    client.send_work_event(&ev_logout).unwrap();
+    assert_eq!(client.outbox_pending_count(), 3);
+
+    let mut received: Vec<WorkEventPayload> = Vec::new();
+    for _ in 0..10 {
+        now_ms += 10;
+        step_client(&mut client, now_ms, |_, _| {});
+        server.step(now_ms, psk_resolver, |event| {
+            if let ServerEvent::Data { client_idx, msg_type, payload } = event {
+                assert_eq!(client_idx, 0);
+                assert_eq!(msg_type, MsgType::Data);
+                assert_eq!(payload.len(), WorkEventPayload::LEN);
+                let decoded = WorkEventPayload::decode(payload).expect("decode WorkEventPayload");
+                received.push(decoded);
+            }
+        });
+        if client.outbox_pending_count() == 0 && received.len() == 3 {
+            break;
+        }
+    }
+
+    assert_eq!(client.outbox_pending_count(), 0);
+    assert_eq!(received.len(), 3);
+    assert_eq!(received[0].kind, WorkEventKind::WorkStart);
+    assert_eq!(received[0], ev_start);
+    assert_eq!(received[1].kind, WorkEventKind::WorkStop);
+    assert_eq!(received[1], ev_stop);
+    assert_eq!(received[2].kind, WorkEventKind::OperatorLogout);
+    assert_eq!(received[2], ev_logout);
 }
 
 #[test]
