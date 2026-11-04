@@ -59,7 +59,7 @@ exec qemu-system-aarch64 \
     -append "console=tty0 console=ttyAMA0 video=${WIDTH}x${HEIGHT}-32 earlycon devtmpfs.mount=1 rw" \
     -device virtio-gpu-pci,xres=$WIDTH,yres=$HEIGHT \
     -device virtio-tablet-pci \
-    -netdev user,id=net0,hostfwd=tcp::8088-:8088 \
+    -netdev user,id=net0 \
     -device virtio-net-pci,netdev=net0 \
     -display "$DISPLAY_OPT" \
     -serial stdio

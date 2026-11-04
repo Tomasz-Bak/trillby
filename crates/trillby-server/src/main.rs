@@ -251,6 +251,7 @@ fn main() {
     let _ = ts(&mut out).and_then(|_| {
         writeln!(out, "LISTEN     addr={ip}:{} devices={}", server.port(), registry.len())
     });
+    let _ = out.flush();
 
     let resolver = |uuid: &[u8; 16]| registry.iter().find(|d| d.uuid == *uuid).map(|d| d.psk);
     let mut uuids: [Option<[u8; 16]>; MAX_CLIENTS] = [None; MAX_CLIENTS];

@@ -150,9 +150,13 @@ dependencies = [
 name = "trillby-server"
 version = "0.1.0"
 dependencies = [
+ "embedded-graphics",
+ "embedded-graphics-framebuf",
  "heapless",
  "libc",
+ "trillby-core",
  "trillby-net",
+ "trillby-ui",
 ]
 
 [[package]]

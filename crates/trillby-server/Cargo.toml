@@ -10,6 +10,12 @@ trillby-net = { path = "../trillby-net" }
 heapless = "0.8"
 libc = "0.2"
 
+
+[dev-dependencies]
+trillby-core = { path = "../trillby-core" }
+trillby-ui = { path = "../trillby-ui" }
+embedded-graphics = "0.8"
+embedded-graphics-framebuf = "0.3"
 [[bin]]
 name = "trillby-server"
 path = "src/main.rs"
