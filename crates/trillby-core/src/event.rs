@@ -8,5 +8,6 @@ pub enum UiEvent {
     TouchMove { scaled: Point, raw: (i32, i32) },
     RfidScanned(String<32>),
     BarcodeScanned(String<64>),
+    NetworkStatusChanged(crate::net_types::NetworkStatus),
     Tick,
 }

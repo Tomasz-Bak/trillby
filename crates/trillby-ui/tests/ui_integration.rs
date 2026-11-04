@@ -67,7 +67,7 @@ fn test_ui_full_interaction_lifecycle() {
         },
         core_screen_bounds,
         core_kb_bounds,
-        None,
+        key_hit,
     );
 
     assert_eq!(state.input_buffer.as_str(), "OP_CARD_9921Q");

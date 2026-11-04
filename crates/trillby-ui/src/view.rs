@@ -80,8 +80,15 @@ impl UiRenderer {
         Text::new("TRILLBY | SCANNER CLIENT", Point::new(12, 24), title_style).draw(target)?;
 
         // Header Status Badge
-        Badge::new(Point::new(260, 9), "ONLINE")
-            .variant(BadgeVariant::Success)
+        let (badge_label, badge_variant) = match state.network_status {
+            trillby_core::net_types::NetworkStatus::Online => ("ONLINE", BadgeVariant::Success),
+            trillby_core::net_types::NetworkStatus::Offline => ("OFFLINE", BadgeVariant::Danger),
+            trillby_core::net_types::NetworkStatus::Connecting => ("LINKING", BadgeVariant::Warning),
+            trillby_core::net_types::NetworkStatus::Handshaking => ("AUTH", BadgeVariant::Warning),
+            trillby_core::net_types::NetworkStatus::Syncing(_) => ("SYNC", BadgeVariant::Info),
+        };
+        Badge::new(Point::new(260, 9), badge_label)
+            .variant(badge_variant)
             .draw(target, &self.theme)?;
 
         // Header Action Buttons (rects shared with UiState hit-testing)

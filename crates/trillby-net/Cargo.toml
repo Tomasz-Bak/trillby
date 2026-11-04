@@ -1,0 +1,13 @@
+[package]
+name = "trillby-net"
+version = "0.1.0"
+edition = "2021"
+authors = ["Trillby Team"]
+description = "Zero-allocation, #![no_std] encrypted binary network transport for Trillby"
+
+[dependencies]
+trillby-core = { path = "../trillby-core" }
+heapless = "0.8"
+libc = "0.2"
+
+[dev-dependencies]

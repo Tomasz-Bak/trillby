@@ -21,7 +21,7 @@ pub fn enter_graphics_mode() {
             log_errno("open", path);
             return;
         }
-        if libc::ioctl(fd, KDSETMODE, KD_GRAPHICS) != 0 {
+        if libc::ioctl(fd, KDSETMODE as _, KD_GRAPHICS) != 0 {
             log_errno("KDSETMODE(KD_GRAPHICS) on", path);
         }
         libc::close(fd);

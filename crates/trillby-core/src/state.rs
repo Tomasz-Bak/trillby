@@ -2,6 +2,7 @@ use crate::event::UiEvent;
 use crate::geometry::{Point, Rect};
 use crate::header::HeaderButton;
 use crate::keyboard_types::{Key, KeyboardLayer};
+use crate::net_types::NetworkStatus;
 use heapless::String;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -31,6 +32,8 @@ pub struct UiState<const N: usize> {
     pub key_count: u32,
     pub tick_count: u64,
     pub dirty: bool,
+    pub network_status: NetworkStatus,
+    pub pending_outbox_count: u16,
     pub active_touch_key: Option<Key>,
     pub last_key_pressed: Option<Key>,
 }
@@ -67,6 +70,8 @@ impl<const N: usize> Default for UiState<N> {
             key_count: 0,
             tick_count: 0,
             dirty: true,
+            network_status: NetworkStatus::Offline,
+            pending_outbox_count: 0,
             active_touch_key: None,
             last_key_pressed: None,
         }
@@ -98,8 +103,8 @@ impl<const N: usize> UiState<N> {
         match event {
             UiEvent::Tick => {
                 self.tick_count = self.tick_count.saturating_add(1);
-                // Trigger 1Hz clock repaint
-                if self.tick_count % 20 == 0 {
+                // Trigger 1Hz periodic UI refresh based on centralized poll frequency
+                if self.tick_count.is_multiple_of(crate::POLL_FREQ_HZ as u64) {
                     self.dirty = true;
                 }
             }
@@ -132,6 +137,15 @@ impl<const N: usize> UiState<N> {
                 self.last_touch_raw = raw;
                 self.last_touch_scaled = Some(scaled);
                 self.dirty = true;
+                if self.keyboard_visible {
+                    if let Some(bounds) = kb_bounds {
+                        if bounds.contains(scaled) {
+                            self.active_touch_key = resolved_key;
+                        } else {
+                            self.active_touch_key = None;
+                        }
+                    }
+                }
             }
             UiEvent::TouchUp { scaled, raw } => {
                 self.last_touch_raw = raw;
@@ -144,7 +158,9 @@ impl<const N: usize> UiState<N> {
                 let _ = write!(log_buf, "TouchUp s:({}, {})", scaled.x, scaled.y);
                 self.push_event_log(&log_buf);
 
-                if let Some(key) = self.active_touch_key.take() {
+                self.active_touch_key = None;
+
+                if let Some(key) = resolved_key {
                     if let Some(bounds) = kb_bounds {
                         if bounds.contains(scaled) {
                             self.apply_key(key);
@@ -178,6 +194,16 @@ impl<const N: usize> UiState<N> {
                 let mut log_buf: String<64> = String::new();
                 let _ = write!(log_buf, "Barcode Scanned: {}", code);
                 self.push_event_log(&log_buf);
+            }
+            UiEvent::NetworkStatusChanged(status) => {
+                if self.network_status != status {
+                    self.network_status = status;
+                    self.dirty = true;
+                    use core::fmt::Write;
+                    let mut log_buf: String<64> = String::new();
+                    let _ = write!(log_buf, "Net Status: {:?}", status);
+                    self.push_event_log(&log_buf);
+                }
             }
         }
     }

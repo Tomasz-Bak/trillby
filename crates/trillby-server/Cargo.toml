@@ -1,0 +1,15 @@
+[package]
+name = "trillby-server"
+version = "0.1.0"
+edition = "2021"
+authors = ["Trillby Team"]
+description = "Minimal floor server sink: accepts Trillby clients and logs events to stdout"
+
+[dependencies]
+trillby-net = { path = "../trillby-net" }
+heapless = "0.8"
+libc = "0.2"
+
+[[bin]]
+name = "trillby-server"
+path = "src/main.rs"
