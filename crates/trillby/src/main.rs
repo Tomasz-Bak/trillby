@@ -1,5 +1,5 @@
 #![no_std]
-#![no_main]
+#![cfg_attr(not(test), no_main)]
 #![allow(dead_code)]
 
 //! Trillby PID-1 binary.
@@ -8,6 +8,9 @@
 //! -> [`init::setup_pid1`] -> UI poll loop in [`run_app`].
 
 extern crate libc;
+
+#[cfg(test)]
+extern crate std;
 
 mod console;
 mod fb;
@@ -26,11 +29,6 @@ pub extern "C" fn main(_argc: libc::c_int, _argv: *const *const libc::c_char) ->
     0
 }
 
-#[cfg(test)]
-#[no_mangle]
-pub extern "C" fn main(_argc: i32, _argv: *const *const u8) -> i32 {
-    0
-}
 
 #[cfg(not(test))]
 #[panic_handler]
@@ -75,12 +73,18 @@ impl<'a> BufferWriter<'a> {
 
 impl<'a> core::fmt::Write for BufferWriter<'a> {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        let bytes = s.as_bytes();
         let rem = self.buf.len().saturating_sub(self.offset);
-        let to_copy = bytes.len().min(rem);
-        self.buf[self.offset..self.offset + to_copy].copy_from_slice(&bytes[..to_copy]);
-        self.offset += to_copy;
-        Ok(())
+        let mut n = s.len().min(rem);
+        while !s.is_char_boundary(n) {
+            n -= 1;
+        }
+        self.buf[self.offset..self.offset + n].copy_from_slice(&s.as_bytes()[..n]);
+        self.offset += n;
+        if n < s.len() {
+            Err(core::fmt::Error)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -252,5 +256,55 @@ fn run_app() {
             fb_writer.write_frame(&buffer);
             state.dirty = false;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::fmt::Write;
+
+    #[test]
+    fn test_buffer_writer_exact_fill() {
+        let mut buf = [0u8; 5];
+        let mut w = BufferWriter::new(&mut buf);
+        let _ = write!(w, "hello");
+        assert_eq!(w.offset, 5);
+        assert_eq!(&buf, b"hello");
+    }
+
+    #[test]
+    fn test_buffer_writer_multi_write_chaining() {
+        let mut buf = [0u8; 10];
+        let mut w = BufferWriter::new(&mut buf);
+        let _ = write!(w, "foo");
+        let _ = write!(w, "bar");
+        let _ = write!(w, "12");
+        assert_eq!(w.offset, 8);
+        assert_eq!(&buf[..8], b"foobar12");
+    }
+
+    #[test]
+    fn test_buffer_writer_overflow_clamping() {
+        let mut buf = [0u8; 5];
+        let mut w = BufferWriter::new(&mut buf);
+        let _ = write!(w, "hello world");
+        assert_eq!(w.offset, 5);
+        assert_eq!(&buf, b"hello");
+    }
+
+    #[test]
+    fn test_buffer_writer_utf8_truncation_does_not_split_codepoint() {
+        let mut buf = [0u8; 4];
+        let offset = {
+            let mut w = BufferWriter::new(&mut buf);
+            let _ = write!(w, "aé🦀");
+            w.offset
+        };
+        assert!(
+            core::str::from_utf8(&buf[..offset]).is_ok(),
+            "truncated buffer must contain valid UTF-8, got invalid slice at offset {}",
+            offset
+        );
     }
 }

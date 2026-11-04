@@ -296,3 +296,337 @@ fn main() {
         let _ = out.flush();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_hex_valid_and_invalid_inputs() {
+        let hex_16_lower = "000102030405060708090a0b0c0d0e0f";
+        let expected_16 = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+            0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+        ];
+        assert_eq!(parse_hex::<16>(hex_16_lower), Some(expected_16));
+
+        let hex_32_lower = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+        let mut expected_32 = [0u8; 32];
+        expected_32[..16].copy_from_slice(&expected_16);
+        for i in 0..16 {
+            expected_32[16 + i] = 0x10 + i as u8;
+        }
+        assert_eq!(parse_hex::<32>(hex_32_lower), Some(expected_32));
+
+        let hex_16_upper = "000102030405060708090A0B0C0D0E0F";
+        assert_eq!(parse_hex::<16>(hex_16_upper), Some(expected_16));
+        let hex_32_upper = "000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F";
+        assert_eq!(parse_hex::<32>(hex_32_upper), Some(expected_32));
+
+        let hex_16_mixed = "000102030405060708090a0B0c0D0e0F";
+        assert_eq!(parse_hex::<16>(hex_16_mixed), Some(expected_16));
+
+        assert_eq!(parse_hex::<16>("012"), None);
+        assert_eq!(parse_hex::<16>("000102030405060708090a0b0c0d0e0"), None);
+        assert_eq!(parse_hex::<16>("000102030405060708090a0b0c0d0e"), None);
+        assert_eq!(parse_hex::<16>("000102030405060708090a0b0c0d0e0f00"), None);
+        assert_eq!(parse_hex::<32>(hex_16_lower), None);
+
+        assert_eq!(parse_hex::<16>("000102030405060708090a0b0c0d0e0g"), None);
+        assert_eq!(parse_hex::<16>("000102030405060708090a0b0c0d0e0G"), None);
+        assert_eq!(parse_hex::<16>("000102030405060708090a0b0c0d0e0/"), None);
+        assert_eq!(parse_hex::<16>("000102030405060708090a0b0c0d0e0:"), None);
+    }
+
+    #[test]
+    fn test_load_registry_parsing_comments_malformed_line_and_max_devices() {
+        let pid = std::process::id();
+
+        struct TempFile(String);
+        impl Drop for TempFile {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+
+        let path_a = format!("/tmp/trillby_test_reg_a_{}.tsv", pid);
+        let _guard_a = TempFile(path_a.clone());
+        let valid_uuid = "000102030405060708090a0b0c0d0e0f";
+        let valid_psk = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+        let content_a = format!(
+            "# Device registry comment\n\
+             \n\
+               # Indented comment\n\
+             {valid_uuid}\t{valid_psk}\textra_col1\textra_col2\n\
+             101112131415161718191a1b1c1d1e1f {valid_psk}\n"
+        );
+        std::fs::write(&path_a, content_a).expect("write temp registry a");
+        let mut reg_a = Registry::new();
+        assert!(load_registry(&path_a, &mut reg_a).is_ok());
+        assert_eq!(reg_a.len(), 2);
+        assert_eq!(reg_a[0].uuid, parse_hex::<16>(valid_uuid).unwrap());
+
+        let path_b = format!("/tmp/trillby_test_reg_b_{}.tsv", pid);
+        let _guard_b = TempFile(path_b.clone());
+        let content_b = format!(
+            "{valid_uuid}\t{valid_psk}\n\
+             \n\
+             bad_uuid_hex\t{valid_psk}\n"
+        );
+        std::fs::write(&path_b, content_b).expect("write temp registry b");
+        let mut reg_b = Registry::new();
+        let err_b = load_registry(&path_b, &mut reg_b).unwrap_err();
+        assert!(
+            err_b.contains(":3: malformed entry"),
+            "expected ':3: malformed entry', got: {err_b}"
+        );
+
+        let path_c = format!("/tmp/trillby_test_reg_c_{}.tsv", pid);
+        let _guard_c = TempFile(path_c.clone());
+        let mut content_c = String::new();
+        for i in 0..=MAX_DEVICES {
+            let uuid = format!("{:032x}", i);
+            content_c.push_str(&format!("{uuid}\t{valid_psk}\n"));
+        }
+        std::fs::write(&path_c, content_c).expect("write temp registry c");
+        let mut reg_c = Registry::new();
+        let err_c = load_registry(&path_c, &mut reg_c).unwrap_err();
+        assert!(
+            err_c.contains("more than 256 devices"),
+            "expected 'more than 256 devices', got: {err_c}"
+        );
+
+        let path_d = format!("/tmp/trillby_test_reg_missing_{}.tsv", pid);
+        let mut reg_d = Registry::new();
+        let err_d = load_registry(&path_d, &mut reg_d).unwrap_err();
+        assert!(err_d.contains(&path_d));
+    }
+
+    #[test]
+    fn test_bytes_formatting_and_log_event_all_branches() {
+        let mut out = Vec::new();
+        bytes(&mut out, b"A\"B").unwrap();
+        assert_eq!(core::str::from_utf8(&out).unwrap(), "\"A\\\"B\"");
+
+        out.clear();
+        bytes(&mut out, &[0x00, 0x1f, 0x7f, 0xff]).unwrap();
+        assert_eq!(core::str::from_utf8(&out).unwrap(), "0x001f7fff");
+
+        let mut uuids: [Option<[u8; 16]>; MAX_CLIENTS] = [None; MAX_CLIENTS];
+
+        out.clear();
+        let dev_uuid = [0x42; 16];
+        log_event(
+            &mut out,
+            &ServerEvent::Connected {
+                client_idx: 0,
+                device_uuid: dev_uuid,
+                session_id: 100,
+            },
+            &mut uuids,
+        )
+        .unwrap();
+        assert_eq!(uuids[0], Some(dev_uuid));
+        let s = core::str::from_utf8(&out).unwrap();
+        assert!(
+            s.contains("CONNECT    client=0 uuid=42424242424242424242424242424242 session=100\n"),
+            "got: {s}"
+        );
+
+        out.clear();
+        log_event(
+            &mut out,
+            &ServerEvent::Disconnected { client_idx: 0 },
+            &mut uuids,
+        )
+        .unwrap();
+        assert_eq!(uuids[0], None);
+        let s = core::str::from_utf8(&out).unwrap();
+        assert!(
+            s.contains("DISCONNECT client=0 uuid=42424242424242424242424242424242\n"),
+            "got: {s}"
+        );
+
+        out.clear();
+        log_event(
+            &mut out,
+            &ServerEvent::Disconnected { client_idx: 1 },
+            &mut uuids,
+        )
+        .unwrap();
+        let s = core::str::from_utf8(&out).unwrap();
+        assert!(s.contains("DISCONNECT client=1\n"), "got: {s}");
+        assert!(!s.contains("uuid="), "must not have uuid=: {s}");
+
+        out.clear();
+        let mut auth_init = AuthInitPayload {
+            auth_data_len: 4,
+            auth_data: [0u8; 32],
+            timestamp_ms: 12345,
+        };
+        auth_init.auth_data[..4].copy_from_slice(b"OP01");
+        let mut auth_buf = [0u8; AuthInitPayload::LEN];
+        auth_init.encode(&mut auth_buf).unwrap();
+        log_event(
+            &mut out,
+            &ServerEvent::Data {
+                client_idx: 0,
+                msg_type: MsgType::AuthInit,
+                payload: &auth_buf,
+            },
+            &mut uuids,
+        )
+        .unwrap();
+        let s = core::str::from_utf8(&out).unwrap();
+        assert!(s.contains("AUTH       client=0 badge=\"OP01\" device_ts_ms=12345\n"), "got: {s}");
+
+        out.clear();
+        log_event(
+            &mut out,
+            &ServerEvent::Data {
+                client_idx: 0,
+                msg_type: MsgType::AuthInit,
+                payload: b"bad",
+            },
+            &mut uuids,
+        )
+        .unwrap();
+        let s = core::str::from_utf8(&out).unwrap();
+        assert!(s.contains("AUTH       client=0 malformed=\"bad\"\n"), "got: {s}");
+
+        out.clear();
+        let hb = HeartbeatPayload {
+            battery_pct: 88,
+            rssi: -55,
+            pending_outbox: 3,
+            uptime_s: 720,
+        };
+        let mut hb_buf = [0u8; HeartbeatPayload::LEN];
+        hb.encode(&mut hb_buf).unwrap();
+        log_event(
+            &mut out,
+            &ServerEvent::Data {
+                client_idx: 0,
+                msg_type: MsgType::Heartbeat,
+                payload: &hb_buf,
+            },
+            &mut uuids,
+        )
+        .unwrap();
+        let s = core::str::from_utf8(&out).unwrap();
+        assert!(
+            s.contains("HEARTBEAT  client=0 battery=88% rssi=-55dBm pending=3 uptime=720s\n"),
+            "got: {s}"
+        );
+
+        out.clear();
+        log_event(
+            &mut out,
+            &ServerEvent::Data {
+                client_idx: 0,
+                msg_type: MsgType::Heartbeat,
+                payload: b"short",
+            },
+            &mut uuids,
+        )
+        .unwrap();
+        let s = core::str::from_utf8(&out).unwrap();
+        assert!(s.contains("HEARTBEAT  client=0 malformed=\"short\"\n"), "got: {s}");
+
+        out.clear();
+        let ws = WorkEventPayload::work_start(b"OP_A", b"JOB_X", 5000);
+        let mut ws_buf = [0u8; WorkEventPayload::LEN];
+        ws.encode(&mut ws_buf).unwrap();
+        log_event(
+            &mut out,
+            &ServerEvent::Data {
+                client_idx: 0,
+                msg_type: MsgType::Data,
+                payload: &ws_buf,
+            },
+            &mut uuids,
+        )
+        .unwrap();
+        let s = core::str::from_utf8(&out).unwrap();
+        assert!(
+            s.contains("WORK_START client=0 operator=\"OP_A\" job=\"JOB_X\" device_ts_ms=5000\n"),
+            "got: {s}"
+        );
+
+        out.clear();
+        let wsp = WorkEventPayload::work_stop(b"OP_A", b"JOB_X", 1500, 6500);
+        let mut wsp_buf = [0u8; WorkEventPayload::LEN];
+        wsp.encode(&mut wsp_buf).unwrap();
+        log_event(
+            &mut out,
+            &ServerEvent::Data {
+                client_idx: 0,
+                msg_type: MsgType::Data,
+                payload: &wsp_buf,
+            },
+            &mut uuids,
+        )
+        .unwrap();
+        let s = core::str::from_utf8(&out).unwrap();
+        assert!(
+            s.contains("WORK_STOP  client=0 operator=\"OP_A\" job=\"JOB_X\" duration_ms=6500 device_ts_ms=1500\n"),
+            "got: {s}"
+        );
+
+        out.clear();
+        let lo = WorkEventPayload::operator_logout(b"OP_A", 7000);
+        let mut lo_buf = [0u8; WorkEventPayload::LEN];
+        lo.encode(&mut lo_buf).unwrap();
+        log_event(
+            &mut out,
+            &ServerEvent::Data {
+                client_idx: 0,
+                msg_type: MsgType::Data,
+                payload: &lo_buf,
+            },
+            &mut uuids,
+        )
+        .unwrap();
+        let s = core::str::from_utf8(&out).unwrap();
+        assert!(
+            s.contains("LOGOUT     client=0 operator=\"OP_A\" device_ts_ms=7000\n"),
+            "got: {s}"
+        );
+
+        out.clear();
+        let mut inv_work_buf = [0u8; WorkEventPayload::LEN];
+        inv_work_buf[0] = 0xff;
+        log_event(
+            &mut out,
+            &ServerEvent::Data {
+                client_idx: 0,
+                msg_type: MsgType::Data,
+                payload: &inv_work_buf,
+            },
+            &mut uuids,
+        )
+        .unwrap();
+        let s = core::str::from_utf8(&out).unwrap();
+        assert!(
+            s.contains("DATA       client=0 type=Data len=115 0xff"),
+            "got: {s}"
+        );
+
+        out.clear();
+        log_event(
+            &mut out,
+            &ServerEvent::Data {
+                client_idx: 0,
+                msg_type: MsgType::Data,
+                payload: b"RAW_CMD",
+            },
+            &mut uuids,
+        )
+        .unwrap();
+        let s = core::str::from_utf8(&out).unwrap();
+        assert!(
+            s.contains("DATA       client=0 type=Data len=7 \"RAW_CMD\"\n"),
+            "got: {s}"
+        );
+    }
+}

@@ -109,4 +109,30 @@ mod tests {
         m.update(b"want for nothing?");
         assert_eq!(m.finalize(), hmac_sha256(b"Jefe", b"what do ya want for nothing?"));
     }
+
+    #[test]
+    fn test_hmac_empty_key_and_exact_64_byte_block_key() {
+        let data = b"Sample message for key boundary testing";
+
+        // Empty key (key.len() == 0)
+        let empty_key = b"";
+        let expected_empty = hex::<32>("ecb335ed2eb8a5ffa590812283341f08b36fd6070a1e3476d19f68acdfcfbda3");
+        assert_eq!(hmac_sha256(empty_key, data), expected_empty);
+
+        let mut inc_empty = HmacSha256::new(empty_key);
+        inc_empty.update(data);
+        assert_eq!(inc_empty.finalize(), expected_empty);
+
+        // Exact 64-byte block key (key.len() == 64)
+        let mut key64 = [0u8; 64];
+        for i in 0..64 {
+            key64[i] = i as u8;
+        }
+        let expected_64 = hex::<32>("f7208193d2b5d8bc02300f1f5c7398189eea7aef78ee1ac657f9aa58bede8451");
+        assert_eq!(hmac_sha256(&key64, data), expected_64);
+
+        let mut inc_64 = HmacSha256::new(&key64);
+        inc_64.update(data);
+        assert_eq!(inc_64.finalize(), expected_64);
+    }
 }

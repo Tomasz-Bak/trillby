@@ -169,7 +169,7 @@ impl DeviceAdapter {
                                             },
                                             core_bounds,
                                             core_kb_bounds,
-                                            None,
+                                            key,
                                         );
                                     }
                                 }
@@ -206,6 +206,135 @@ impl DeviceAdapter {
         let len = w.offset;
         if let Ok(s) = core::str::from_utf8(&log_buf[..len]) {
             raw_print(s);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use embedded_graphics::geometry::Size;
+    use embedded_graphics::primitives::Rectangle;
+    use trillby_core::SessionState;
+    use trillby_ui::eg_rect_to_core;
+
+    #[test]
+    fn test_qemu_scale_touch_boundaries_and_clamping() {
+        let adapter = DeviceAdapter {
+            tty_fd: -1,
+            touch_max_x: QEMU_RAW_MAX_X,
+            touch_max_y: QEMU_RAW_MAX_Y,
+            serial_line_buf: [0u8; 128],
+            serial_line_len: 0,
+        };
+
+        assert_eq!(adapter.scale_touch(0, 0), Point::new(0, 0));
+        assert_eq!(
+            adapter.scale_touch(QEMU_RAW_MAX_X as i32, QEMU_RAW_MAX_Y as i32),
+            Point::new(799, 479)
+        );
+        assert_eq!(adapter.scale_touch(-100, -200), Point::new(0, 0));
+        assert_eq!(adapter.scale_touch(50_000, 60_000), Point::new(799, 479));
+    }
+
+    #[test]
+    fn test_qemu_pipe_serial_commands_and_click_key_dispatch() {
+        let mut pipe_fds = [0; 2];
+        let rc = unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_NONBLOCK) };
+        assert_eq!(rc, 0);
+        let rfd = pipe_fds[0];
+        let wfd = pipe_fds[1];
+
+        let mut adapter = DeviceAdapter {
+            tty_fd: rfd,
+            touch_max_x: QEMU_RAW_MAX_X,
+            touch_max_y: QEMU_RAW_MAX_Y,
+            serial_line_buf: [0u8; 128],
+            serial_line_len: 0,
+        };
+
+        let mut state = UiState::<256>::new();
+        let screen_bounds = Rectangle::new(Point::zero(), Size::new(800, 480));
+        let core_bounds = eg_rect_to_core(screen_bounds);
+
+        let pfd = libc::pollfd {
+            fd: rfd,
+            events: libc::POLLIN,
+            revents: libc::POLLIN,
+        };
+
+        let send_cmd = |wfd: libc::c_int, cmd: &[u8]| {
+            let n = unsafe { libc::write(wfd, cmd.as_ptr() as *const _, cmd.len()) };
+            assert_eq!(n as usize, cmd.len());
+        };
+
+        // 1. Fragmented rfid read: write "rfid OP_" -> handle_fd -> write "77\r\n" -> handle_fd
+        let zones = LayoutZones::compute(screen_bounds, state.keyboard_visible);
+        let core_kb_bounds = zones.keyboard_area.map(eg_rect_to_core);
+        send_cmd(wfd, b"rfid OP_");
+        adapter.handle_fd(&pfd, &mut state, &zones, core_bounds, core_kb_bounds);
+        assert_eq!(*state.session_state(), SessionState::Idle);
+
+        send_cmd(wfd, b"77\r\n");
+        adapter.handle_fd(&pfd, &mut state, &zones, core_bounds, core_kb_bounds);
+        match state.session_state() {
+            SessionState::Authenticated { operator_id } => {
+                assert_eq!(operator_id.as_str(), "OP_77");
+            }
+            other => panic!("expected Authenticated(OP_77), got: {:?}", other),
+        }
+
+        // 2. Barcode JOB_88\n -> starts job, auto-shows virtual keyboard
+        let zones = LayoutZones::compute(screen_bounds, state.keyboard_visible);
+        let core_kb_bounds = zones.keyboard_area.map(eg_rect_to_core);
+        send_cmd(wfd, b"barcode JOB_88\n");
+        adapter.handle_fd(&pfd, &mut state, &zones, core_bounds, core_kb_bounds);
+        match state.session_state() {
+            SessionState::Working { job_id, .. } => {
+                assert_eq!(job_id.as_str(), "JOB_88");
+            }
+            other => panic!("expected Working(JOB_88), got: {:?}", other),
+        }
+        assert!(state.keyboard_visible);
+
+        // 3. Type AB\n -> appends "AB" to state.input_buffer
+        let zones = LayoutZones::compute(screen_bounds, state.keyboard_visible);
+        let core_kb_bounds = zones.keyboard_area.map(eg_rect_to_core);
+        send_cmd(wfd, b"type AB\n");
+        adapter.handle_fd(&pfd, &mut state, &zones, core_bounds, core_kb_bounds);
+        assert_eq!(state.input_buffer.as_str(), "AB");
+
+        // 4. Scale 1600 960\n -> updates touch_max_x = 1600, touch_max_y = 960
+        send_cmd(wfd, b"scale 1600 960\n");
+        adapter.handle_fd(&pfd, &mut state, &zones, core_bounds, core_kb_bounds);
+        assert_eq!(adapter.touch_max_x, 1600);
+        assert_eq!(adapter.touch_max_y, 960);
+
+        // Scale -1 500\n -> ignored
+        send_cmd(wfd, b"scale -1 500\n");
+        adapter.handle_fd(&pfd, &mut state, &zones, core_bounds, core_kb_bounds);
+        assert_eq!(adapter.touch_max_x, 1600);
+        assert_eq!(adapter.touch_max_y, 960);
+
+        // 5. Click 40 320\n (hits 'Q' on the visible Alpha virtual keyboard)
+        let zones = LayoutZones::compute(screen_bounds, state.keyboard_visible);
+        let core_kb_bounds = zones.keyboard_area.map(eg_rect_to_core);
+        send_cmd(wfd, b"click 40 320\n");
+        adapter.handle_fd(&pfd, &mut state, &zones, core_bounds, core_kb_bounds);
+        assert_eq!(
+            state.input_buffer.as_str(),
+            "ABQ",
+            "click on virtual key 'Q' must append 'Q' to input_buffer"
+        );
+        assert_eq!(
+            state.key_count,
+            1,
+            "click on virtual key 'Q' must increment key_count"
+        );
+
+        unsafe {
+            libc::close(rfd);
+            libc::close(wfd);
         }
     }
 }

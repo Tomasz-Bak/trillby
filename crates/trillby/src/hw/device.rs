@@ -44,3 +44,19 @@ impl DeviceAdapter {
     #[inline(always)]
     pub fn log_touch_down(&self, _raw_x: i32, _raw_y: i32, _scaled: CorePoint) {}
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_device_adapter_scale_touch_clamping() {
+        let adapter = DeviceAdapter::new();
+
+        assert_eq!(adapter.scale_touch(-10, -20), Point::new(0, 0));
+        assert_eq!(adapter.scale_touch(0, 0), Point::new(0, 0));
+        assert_eq!(adapter.scale_touch(799, 479), Point::new(799, 479));
+        assert_eq!(adapter.scale_touch(800, 480), Point::new(799, 479));
+        assert_eq!(adapter.scale_touch(10_000, 10_000), Point::new(799, 479));
+    }
+}

@@ -174,4 +174,45 @@ mod tests {
             Err(OutboxError::FrameTooLarge)
         );
     }
+
+    #[test]
+    fn test_outbox_clear_and_capacity_reuse() {
+        let mut outbox: Outbox<3> = Outbox::new();
+        assert_eq!(outbox.capacity(), 3);
+        assert!(outbox.is_empty());
+        assert_eq!(outbox.len(), 0);
+
+        // Fill to capacity
+        assert!(outbox.push(MsgType::Data, b"EVENT_1").is_ok());
+        assert!(outbox.push(MsgType::Data, b"EVENT_2").is_ok());
+        assert!(outbox.push(MsgType::Data, b"EVENT_3").is_ok());
+        assert!(outbox.is_full());
+        assert_eq!(outbox.len(), 3);
+        assert_eq!(outbox.push(MsgType::Data, b"EVENT_4"), Err(OutboxError::Full));
+
+        // Clear outbox
+        outbox.clear();
+        assert!(outbox.is_empty());
+        assert!(!outbox.is_full());
+        assert_eq!(outbox.len(), 0);
+        assert_eq!(outbox.peek(), None);
+        assert!(!outbox.pop());
+
+        // Re-fill to capacity to verify reuse
+        assert!(outbox.push(MsgType::Data, b"EVENT_A").is_ok());
+        assert!(outbox.push(MsgType::Data, b"EVENT_B").is_ok());
+        assert!(outbox.push(MsgType::Data, b"EVENT_C").is_ok());
+        assert!(outbox.is_full());
+        assert_eq!(outbox.len(), 3);
+        assert_eq!(outbox.push(MsgType::Data, b"EVENT_D"), Err(OutboxError::Full));
+
+        assert_eq!(outbox.peek().unwrap().1, b"EVENT_A");
+        assert!(outbox.pop());
+        assert_eq!(outbox.peek().unwrap().1, b"EVENT_B");
+        assert!(outbox.pop());
+        assert_eq!(outbox.peek().unwrap().1, b"EVENT_C");
+        assert!(outbox.pop());
+        assert!(outbox.is_empty());
+        assert!(!outbox.pop());
+    }
 }

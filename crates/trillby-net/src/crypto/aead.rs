@@ -246,4 +246,45 @@ If I could offer you only one tip for the future, sunscreen would be it.";
         let pt_len = chacha20_poly1305_decrypt(&key, &nonce, b"", &mut buf).unwrap();
         assert_eq!(pt_len, 0);
     }
+
+    #[test]
+    fn test_aead_short_buffers_and_16_byte_multiple_alignment() {
+        let key = [0x42u8; 32];
+        let nonce = [0x17u8; 12];
+        let aad = [0x33u8; 32];
+
+        // 1. Buffers shorter than TAG_LEN (16 bytes) must return Err(())
+        let mut buf0 = [0u8; 0];
+        assert_eq!(chacha20_poly1305_encrypt(&key, &nonce, &aad, &mut buf0), Err(()));
+        assert_eq!(chacha20_poly1305_decrypt(&key, &nonce, &aad, &mut buf0), Err(()));
+
+        let mut buf1 = [0u8; 1];
+        assert_eq!(chacha20_poly1305_encrypt(&key, &nonce, &aad, &mut buf1), Err(()));
+        assert_eq!(chacha20_poly1305_decrypt(&key, &nonce, &aad, &mut buf1), Err(()));
+
+        let mut buf15 = [0u8; 15];
+        assert_eq!(chacha20_poly1305_encrypt(&key, &nonce, &aad, &mut buf15), Err(()));
+        assert_eq!(chacha20_poly1305_decrypt(&key, &nonce, &aad, &mut buf15), Err(()));
+
+        // 2. Round-trip when aad.len() in [16, 32] and pt_len in [16, 32] (% 16 == 0)
+        let sample_pt = [0xa5u8; 32];
+        for &aad_len in &[16, 32] {
+            for &pt_len in &[16, 32] {
+                let cur_aad = &aad[..aad_len];
+                let cur_pt = &sample_pt[..pt_len];
+
+                let mut buf = [0u8; 48]; // 32 pt + 16 tag
+                buf[..pt_len].copy_from_slice(cur_pt);
+
+                assert_eq!(
+                    chacha20_poly1305_encrypt(&key, &nonce, cur_aad, &mut buf[..pt_len + 16]),
+                    Ok(())
+                );
+                let dec_len = chacha20_poly1305_decrypt(&key, &nonce, cur_aad, &mut buf[..pt_len + 16])
+                    .expect("decrypt 16-byte aligned payload");
+                assert_eq!(dec_len, pt_len);
+                assert_eq!(&buf[..dec_len], cur_pt);
+            }
+        }
+    }
 }

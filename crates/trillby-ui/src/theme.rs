@@ -17,6 +17,7 @@ pub trait Theme {
     #[inline] fn border(&self) -> Rgb565 { Rgb565::new(12, 28, 17) } // #64748B
     #[inline] fn warning(&self) -> Rgb565 { Rgb565::new(30, 39, 1) } // #F59E0B
     #[inline] fn success(&self) -> Rgb565 { Rgb565::new(2, 46, 16) } // #10B981
+    #[inline] fn danger(&self) -> Rgb565 { Rgb565::new(29, 17, 8) } // #EF4444
 
     // Geometry & Spacing
     #[inline] fn radius_sm(&self) -> Size { Size::new(4, 4) }

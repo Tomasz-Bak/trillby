@@ -95,3 +95,133 @@ impl FramebufferWriter {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::fmt::Write;
+
+    fn create_temp_fd() -> libc::c_int {
+        let pid = unsafe { libc::getpid() };
+        let mut path = [0u8; 64];
+        let mut w = crate::BufferWriter::new(&mut path);
+        let _ = write!(w, "/tmp/trillby_fb_{}_{}\0", pid, unsafe { libc::rand() });
+        let fd = unsafe {
+            libc::open(
+                path.as_ptr() as *const _,
+                libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
+                0o600,
+            )
+        };
+        assert!(fd >= 0, "failed to create temp file");
+        unsafe {
+            libc::unlink(path.as_ptr() as *const _);
+        }
+        fd
+    }
+    fn new_boxed_fb() -> std::boxed::Box<FramebufferWriter> {
+        unsafe {
+            let layout = std::alloc::Layout::new::<FramebufferWriter>();
+            let ptr = std::alloc::alloc_zeroed(layout) as *mut FramebufferWriter;
+            assert!(!ptr.is_null());
+            (*ptr).fd = -1;
+            std::boxed::Box::from_raw(ptr)
+        }
+    }
+
+    fn new_boxed_pixels() -> std::boxed::Box<[Rgb565; 800 * 480]> {
+        std::vec![Rgb565::new(0, 0, 0); 800 * 480]
+            .into_boxed_slice()
+            .try_into()
+            .unwrap()
+    }
+
+    #[test]
+    fn test_fb_write_frame_16bpp() {
+        let fd = create_temp_fd();
+        let mut fb = new_boxed_fb();
+        fb.fd = fd;
+        fb.bpp = 16;
+
+        let mut pixels = new_boxed_pixels();
+
+        pixels[0] = Rgb565::new(31, 0, 0);
+        pixels[1] = Rgb565::new(0, 63, 0);
+        pixels[2] = Rgb565::new(0, 0, 31);
+
+        fb.write_frame(&pixels);
+        assert_eq!(fb.fd, fd);
+
+        unsafe {
+            libc::lseek(fd, 0, libc::SEEK_SET);
+        }
+        let expected_len = 800 * 480 * 2;
+        let mut read_buf = std::vec![0u8; expected_len];
+        let n = unsafe {
+            libc::read(fd, read_buf.as_mut_ptr() as *mut _, expected_len)
+        };
+        assert_eq!(n as usize, expected_len);
+
+        let raw_pixels: &[u8] = unsafe {
+            core::slice::from_raw_parts(pixels.as_ptr() as *const u8, expected_len)
+        };
+        assert_eq!(&read_buf[..], raw_pixels);
+
+        unsafe {
+            libc::close(fd);
+        }
+    }
+
+    #[test]
+    fn test_fb_write_frame_32bpp_bgrx_conversion() {
+        let fd = create_temp_fd();
+        let mut fb = new_boxed_fb();
+        fb.fd = fd;
+        fb.bpp = 32;
+
+        let mut pixels = new_boxed_pixels();
+
+        pixels[0] = Rgb565::new(31, 0, 0);
+        pixels[1] = Rgb565::new(0, 63, 0);
+        pixels[2] = Rgb565::new(0, 0, 31);
+
+        fb.write_frame(&pixels);
+        assert_eq!(fb.fd, fd);
+
+        assert_eq!(
+            &fb.bgrx_buf[0..12],
+            &[0, 0, 255, 255, 0, 255, 0, 255, 255, 0, 0, 255]
+        );
+
+        unsafe {
+            libc::lseek(fd, 0, libc::SEEK_SET);
+        }
+        let mut read_header = [0u8; 12];
+        let n = unsafe {
+            libc::read(fd, read_header.as_mut_ptr() as *mut _, 12)
+        };
+        assert_eq!(n, 12);
+        assert_eq!(
+            &read_header,
+            &[0, 0, 255, 255, 0, 255, 0, 255, 255, 0, 0, 255]
+        );
+
+        unsafe {
+            libc::close(fd);
+        }
+    }
+
+    #[test]
+    fn test_fb_write_frame_invalid_fd_resets_to_minus_one() {
+        let mut fb = new_boxed_fb();
+        let read_only_fd = unsafe { libc::open(b"/dev/null\0".as_ptr() as *const _, libc::O_RDONLY) };
+        assert!(read_only_fd >= 0);
+        fb.fd = read_only_fd;
+        fb.bpp = 16;
+
+        let pixels = new_boxed_pixels();
+
+        fb.write_frame(&pixels);
+        assert_eq!(fb.fd, -1, "invalid writable fd must reset fb.fd to -1");
+    }
+}

@@ -50,24 +50,27 @@ impl<'a> Button<'a> {
         D: DrawTarget<Color = Rgb565>,
         C: Theme,
     {
-        let (bg_color, stroke_color, text_color) = match (self.variant, self.is_pressed) {
-            (ButtonVariant::Primary, false) => (theme.primary(), theme.primary(), theme.primary_text()),
-            (ButtonVariant::Primary, true) => (theme.surface_active(), theme.primary(), theme.primary_text()),
-            (ButtonVariant::Secondary, false) => (theme.surface_active(), theme.border(), theme.text()),
-            (ButtonVariant::Secondary, true) => (theme.surface(), theme.border(), theme.text()),
-            (ButtonVariant::Outline, false) => (theme.surface(), theme.border(), theme.text()),
-            (ButtonVariant::Outline, true) => (theme.surface_active(), theme.border(), theme.primary()),
-            (ButtonVariant::Danger, false) => (theme.warning(), theme.warning(), theme.primary_text()),
-            (ButtonVariant::Danger, true) => (theme.surface_active(), theme.warning(), theme.warning()),
-            (ButtonVariant::Ghost, false) => (theme.background(), theme.background(), theme.text_muted()),
-            (ButtonVariant::Ghost, true) => (theme.surface_active(), theme.border(), theme.text()),
+        let (fill, stroke, text_color) = match (self.variant, self.is_pressed) {
+            (ButtonVariant::Primary, false) => (Some(theme.primary()), Some(theme.primary()), theme.primary_text()),
+            (ButtonVariant::Primary, true) => (Some(theme.surface_active()), Some(theme.primary()), theme.primary_text()),
+            (ButtonVariant::Secondary, false) => (Some(theme.surface()), Some(theme.border()), theme.text()),
+            (ButtonVariant::Secondary, true) => (Some(theme.surface_active()), Some(theme.border()), theme.text()),
+            (ButtonVariant::Outline, false) => (Some(theme.surface()), Some(theme.border()), theme.text()),
+            (ButtonVariant::Outline, true) => (Some(theme.surface_active()), Some(theme.border()), theme.primary()),
+            (ButtonVariant::Danger, false) => (Some(theme.danger()), Some(theme.danger()), theme.primary_text()),
+            (ButtonVariant::Danger, true) => (Some(theme.surface_active()), Some(theme.danger()), theme.danger()),
+            (ButtonVariant::Ghost, false) => (None, None, theme.text_muted()),
+            (ButtonVariant::Ghost, true) => (Some(theme.surface_active()), Some(theme.border()), theme.text()),
         };
 
-        let style = PrimitiveStyleBuilder::new()
-            .fill_color(bg_color)
-            .stroke_color(stroke_color)
-            .stroke_width(1)
-            .build();
+        let mut b = PrimitiveStyleBuilder::new().stroke_width(1);
+        if let Some(c) = fill {
+            b = b.fill_color(c);
+        }
+        if let Some(c) = stroke {
+            b = b.stroke_color(c);
+        }
+        let style = b.build();
 
         RoundedRectangle::with_equal_corners(self.bounds, theme.radius_sm())
             .into_styled(style)
@@ -82,7 +85,8 @@ impl<'a> Button<'a> {
         let tx = self.bounds.top_left.x + (self.bounds.size.width as i32 - text_w) / 2;
         let ty = self.bounds.top_left.y + (self.bounds.size.height as i32 - char_h) / 2 + font.baseline as i32;
 
-        Text::new(self.label, Point::new(tx, ty), font_style).draw(target)?;
+        Text::new(self.label, Point::new(tx, ty), font_style)
+            .draw(&mut target.clipped(&self.bounds))?;
 
         Ok(())
     }

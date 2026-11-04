@@ -245,4 +245,90 @@ mod tests {
             assert_eq!(area, KB.size.width * KB.size.height);
         }
     }
+
+    #[test]
+    fn all_alpha_and_symbols_slots_resolve_at_edges_and_labels_match() {
+        for layer in [KeyboardLayer::Alpha, KeyboardLayer::Symbols] {
+            for (rect, slot) in KeyboardGrid::slots(KB, layer) {
+                let mut buf = [0u8; 4];
+                let label = slot.label(layer, &mut buf);
+                match slot.key {
+                    Key::Space => assert_eq!(label, "SPACE"),
+                    Key::Backspace => assert_eq!(label, "DEL"),
+                    Key::Enter => assert_eq!(label, "ENTER"),
+                    Key::LayerToggle => match layer {
+                        KeyboardLayer::Alpha => assert_eq!(label, "?123"),
+                        KeyboardLayer::Symbols => assert_eq!(label, "ABC"),
+                    },
+                    Key::Special(_) => assert_eq!(label, ""),
+                    Key::Char(c) => {
+                        let mut expected = [0u8; 4];
+                        assert_eq!(label, c.encode_utf8(&mut expected));
+                    }
+                }
+
+                assert_eq!(KeyboardGrid::slot_at(KB, rect.top_left, layer), Some(slot));
+                let bottom_right = rect.top_left
+                    + Point::new(rect.size.width as i32 - 1, rect.size.height as i32 - 1);
+                assert_eq!(KeyboardGrid::slot_at(KB, bottom_right, layer), Some(slot));
+            }
+
+            for &pt in &[
+                Point::new(0, 299),
+                Point::new(-1, 350),
+                Point::new(800, 350),
+                Point::new(400, 480),
+            ] {
+                assert_eq!(KeyboardGrid::slot_at(KB, pt, layer), None);
+            }
+        }
+    }
+
+    #[test]
+    fn cells_tile_disjointly_without_gaps_on_non_divisible_bounds() {
+        let bounds = Rectangle::new(Point::new(3, 7), Size::new(799, 179));
+        for layer in [KeyboardLayer::Alpha, KeyboardLayer::Symbols] {
+            let mut total_area = 0u32;
+            let mut prev_row_bottom_y = bounds.top_left.y;
+            let mut row_height_sum = 0u32;
+
+            for (row_idx, row_slots) in KeyboardGrid::layout(layer).iter().enumerate() {
+                let mut unit = 0usize;
+                let mut prev_cell_right_x = bounds.top_left.x;
+                let mut row_width_sum = 0u32;
+                let mut current_row_height = None;
+
+                for &slot in row_slots.iter() {
+                    let cell = cell_rect(bounds, row_idx, unit, slot.span as usize);
+                    unit += slot.span as usize;
+
+                    // Zero gap, zero overlap horizontally
+                    assert_eq!(cell.top_left.x, prev_cell_right_x);
+                    prev_cell_right_x = cell.top_left.x + cell.size.width as i32;
+                    row_width_sum += cell.size.width;
+
+                    if let Some(h) = current_row_height {
+                        assert_eq!(cell.size.height, h);
+                        assert_eq!(cell.top_left.y, prev_row_bottom_y);
+                    } else {
+                        current_row_height = Some(cell.size.height);
+                        assert_eq!(cell.top_left.y, prev_row_bottom_y);
+                    }
+
+                    total_area += cell.size.width * cell.size.height;
+                }
+
+                assert_eq!(row_width_sum, 799);
+                assert_eq!(prev_cell_right_x, bounds.top_left.x + 799);
+
+                let h = current_row_height.unwrap();
+                row_height_sum += h;
+                prev_row_bottom_y += h as i32;
+            }
+
+            assert_eq!(row_height_sum, 179);
+            assert_eq!(prev_row_bottom_y, bounds.top_left.y + 179);
+            assert_eq!(total_area, 799 * 179);
+        }
+    }
 }

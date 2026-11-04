@@ -212,24 +212,172 @@ fn test_monotonic_backoff_timing() {
     // Socket encounters POLLERR at t = 1050ms
     let _ = client.poll_step(1050, libc::POLLERR);
 
-    // Client must transition to Disconnected with next_attempt_ms = 1050 + 2000 = 3050ms
+    // Client must transition to Disconnected with next_attempt_ms = 1050 + 1000 = 2050ms
     assert!(matches!(
         client.state(),
-        ClientState::Disconnected { next_attempt_ms: 3050, backoff_ms: 4000 }
+        ClientState::Disconnected { next_attempt_ms: 2050, backoff_ms: 2000 }
     ));
 
-    // Poll at t = 2500ms (< 3050ms) -> Must NOT initiate connection
-    let _ = client.poll_step(2500, 0);
+    // Poll at t = 2000ms (< 2050ms) -> Must NOT initiate connection
+    let _ = client.poll_step(2000, 0);
     assert!(matches!(
         client.state(),
-        ClientState::Disconnected { next_attempt_ms: 3050, .. }
+        ClientState::Disconnected { next_attempt_ms: 2050, .. }
     ));
 
-    // Poll at t = 3050ms (>= 3050ms) -> Must initiate reconnection attempt
-    let _ = client.poll_step(3050, 0);
+    // Poll at t = 2050ms (>= 2050ms) -> Must initiate reconnection attempt
+    let _ = client.poll_step(2050, 0);
     assert!(!matches!(
         client.state(),
-        ClientState::Disconnected { next_attempt_ms: 3050, .. }
+        ClientState::Disconnected { next_attempt_ms: 2050, .. }
     ));
+}
+
+#[test]
+fn test_directional_aead_nonce_and_reflection_isolation() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use trillby_net::{
+        derive_session_key, pack_and_authenticate_hmac, pack_and_encrypt,
+        verify_and_unpack_hmac, FrameHeader, HandshakeInitPayload, HandshakeRespPayload,
+        HEADER_LEN, MAX_FRAME_LEN,
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+    let port = listener.local_addr().unwrap().port();
+    listener.set_nonblocking(true).unwrap();
+
+    let psk = [0x42u8; 32];
+    let uuid = [0x55u8; 16];
+    let mut client: NetClient<4> = NetClient::new(psk, uuid, [127, 0, 0, 1], port);
+    let mut now_ms = 1000u64;
+
+    // Step 1: Connect client
+    client.poll_step(now_ms, 0);
+
+    let mut peer_stream = {
+        let start = std::time::Instant::now();
+        loop {
+            match listener.accept() {
+                Ok((s, _)) => break s,
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if start.elapsed() > std::time::Duration::from_millis(500) {
+                        panic!("Timeout waiting for client connection");
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(e) => panic!("Accept error: {:?}", e),
+            }
+        }
+    };
+    peer_stream.set_nonblocking(true).unwrap();
+    peer_stream.set_nodelay(true).unwrap();
+
+    // Step 2: Client transmits HandshakeInit
+    now_ms += 10;
+    client.poll_step(now_ms, libc::POLLOUT);
+    assert_eq!(client.status(), NetworkStatus::Handshaking);
+
+    // Step 3: Peer reads HandshakeInit
+    let mut init_buf = [0u8; MAX_FRAME_LEN];
+    peer_stream.set_nonblocking(false).unwrap();
+    peer_stream.read_exact(&mut init_buf[..HEADER_LEN]).unwrap();
+    let init_hdr = FrameHeader::decode(&init_buf[..HEADER_LEN]).unwrap();
+    let total_init_len = HEADER_LEN + init_hdr.payload_len as usize;
+    peer_stream.read_exact(&mut init_buf[HEADER_LEN..total_init_len]).unwrap();
+    peer_stream.set_nonblocking(true).unwrap();
+
+    let (_hdr, init_pt) = verify_and_unpack_hmac(&psk, &init_buf[..total_init_len]).unwrap();
+    let init_payload = HandshakeInitPayload::decode(init_pt).unwrap();
+
+    // Step 4: Peer responds with HandshakeResp
+    let server_nonce = [0x66u8; 32];
+    let session_id = 12345u32;
+    let session_salt = [1, 2, 3, 4];
+    let resp_payload = HandshakeRespPayload {
+        server_nonce,
+        assigned_session_id: session_id,
+        session_salt,
+    };
+    let mut resp_pt = [0u8; HandshakeRespPayload::LEN];
+    resp_payload.encode(&mut resp_pt).unwrap();
+    let mut resp_frame = [0u8; MAX_FRAME_LEN];
+    let resp_len = pack_and_authenticate_hmac(
+        &psk,
+        MsgType::HandshakeResp,
+        session_id,
+        0,
+        &resp_pt,
+        &mut resp_frame,
+    ).unwrap();
+    peer_stream.write_all(&resp_frame[..resp_len]).unwrap();
+
+    // Step 5: Client receives HandshakeResp and transitions to Online
+    now_ms += 10;
+    client.poll_step(now_ms, libc::POLLIN);
+    assert_eq!(client.status(), NetworkStatus::Online);
+
+    let session_key = derive_session_key(
+        &psk,
+        &session_salt,
+        &init_payload.client_nonce,
+        &server_nonce,
+    );
+
+    // Step 6: Client flushes encrypted frame (seq_num = 1)
+    let test_plaintext = b"DIRECTIONAL_ISOLATION_TEST_PLAINTEXT";
+    client.send_data(test_plaintext).unwrap();
+    now_ms += 10;
+    client.poll_step(now_ms, libc::POLLOUT);
+
+    // Step 7: Peer reads raw wire bytes of client frame
+    let mut client_frame = [0u8; MAX_FRAME_LEN];
+    peer_stream.set_nonblocking(false).unwrap();
+    peer_stream.read_exact(&mut client_frame[..HEADER_LEN]).unwrap();
+    let c_hdr = FrameHeader::decode(&client_frame[..HEADER_LEN]).unwrap();
+    let client_frame_len = HEADER_LEN + c_hdr.payload_len as usize;
+    peer_stream.read_exact(&mut client_frame[HEADER_LEN..client_frame_len]).unwrap();
+    peer_stream.set_nonblocking(true).unwrap();
+    assert_eq!(c_hdr.seq_num, 1);
+
+    // Step 8: Encrypt same plaintext on server for seq_num = 1
+    let mut server_frame = [0u8; MAX_FRAME_LEN];
+    let server_frame_len = pack_and_encrypt(
+        &session_key,
+        &session_salt,
+        MsgType::Data,
+        session_id,
+        1,
+        test_plaintext,
+        &mut server_frame,
+    ).unwrap();
+    assert_eq!(client_frame_len, server_frame_len);
+
+    // Verify client->server and server->client ciphertexts are NOT equal (keystream isolation)
+    assert_ne!(
+        &client_frame[..client_frame_len],
+        &server_frame[..server_frame_len],
+        "Client->server and server->client ciphertexts must not reuse the same keystream"
+    );
+
+    // Step 9: Reflect client_frame directly back into client socket
+    peer_stream.write_all(&client_frame[..client_frame_len]).unwrap();
+
+    // Step 10: Step client with POLLIN
+    now_ms += 10;
+    let mut data_callbacks = 0;
+    client.poll_step_with(now_ms, libc::POLLIN, |_msg_type, _payload| {
+        data_callbacks += 1;
+    });
+
+    // Client must reject reflected client->server frame and transition to Disconnected
+    assert_eq!(
+        data_callbacks, 0,
+        "Client must not accept and deliver reflected client->server frame"
+    );
+    assert!(
+        matches!(client.state(), ClientState::Disconnected { .. }),
+        "Client must disconnect upon receiving reflected client->server frame"
+    );
 }
 

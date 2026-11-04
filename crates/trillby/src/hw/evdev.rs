@@ -189,3 +189,162 @@ impl EvdevTouch {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use embedded_graphics::geometry::{Point, Size};
+    use embedded_graphics::primitives::Rectangle;
+    use trillby_ui::eg_rect_to_core;
+
+    fn write_event(wfd: libc::c_int, type_: u16, code: u16, value: i32) {
+        let ev = InputEvent {
+            time: libc::timeval { tv_sec: 0, tv_usec: 0 },
+            type_,
+            code,
+            value,
+        };
+        let n = unsafe {
+            libc::write(
+                wfd,
+                &ev as *const _ as *const libc::c_void,
+                core::mem::size_of::<InputEvent>(),
+            )
+        };
+        assert_eq!(n as usize, core::mem::size_of::<InputEvent>());
+    }
+
+    fn setup_test_pipe() -> (libc::c_int, libc::c_int, EvdevTouch) {
+        let mut pipe_fds = [0; 2];
+        let rc = unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_NONBLOCK) };
+        assert_eq!(rc, 0);
+        let rfd = pipe_fds[0];
+        let wfd = pipe_fds[1];
+
+        let touch = EvdevTouch {
+            fds: [rfd, -1, -1, -1, -1, -1, -1, -1, -1, -1],
+            count: 1,
+            raw_x: 0,
+            raw_y: 0,
+            is_touch_down: false,
+            touch_moved: false,
+        };
+
+        (rfd, wfd, touch)
+    }
+
+    #[test]
+    fn test_evdev_hover_abs_without_btn_touch() {
+        let (rfd, wfd, mut touch) = setup_test_pipe();
+        let adapter = super::super::adapter::DeviceAdapter::new();
+        let mut state = UiState::<256>::new();
+        let screen_bounds = Rectangle::new(Point::zero(), Size::new(800, 480));
+        let zones = LayoutZones::compute(screen_bounds, state.keyboard_visible);
+        let core_bounds = eg_rect_to_core(screen_bounds);
+        let core_kb_bounds = zones.keyboard_area.map(eg_rect_to_core);
+
+        let pfd = libc::pollfd {
+            fd: rfd,
+            events: libc::POLLIN,
+            revents: libc::POLLIN,
+        };
+
+        write_event(wfd, 3, 0, 100);
+        write_event(wfd, 3, 1, 200);
+
+        let handled = touch.handle_fd(&pfd, &adapter, &mut state, &zones, core_bounds, core_kb_bounds);
+        assert!(handled);
+        assert_eq!(touch.raw_x, 100);
+        assert_eq!(touch.raw_y, 200);
+        assert!(!touch.is_touch_down);
+        assert!(touch.touch_moved);
+
+        touch.finish_poll_step(&adapter, &mut state, &zones, core_bounds, core_kb_bounds);
+        assert_eq!(state.last_touch_scaled, None);
+        assert_eq!(state.touch_count, 0);
+
+        unsafe {
+            libc::close(rfd);
+            libc::close(wfd);
+        }
+    }
+
+    #[test]
+    fn test_evdev_btn_touch_batching_and_coalesced_touch_move() {
+        let (rfd, wfd, mut touch) = setup_test_pipe();
+        let adapter = super::super::adapter::DeviceAdapter::new();
+        let mut state = UiState::<256>::new();
+        let screen_bounds = Rectangle::new(Point::zero(), Size::new(800, 480));
+        let zones = LayoutZones::compute(screen_bounds, state.keyboard_visible);
+        let core_bounds = eg_rect_to_core(screen_bounds);
+        let core_kb_bounds = zones.keyboard_area.map(eg_rect_to_core);
+
+        let pfd = libc::pollfd {
+            fd: rfd,
+            events: libc::POLLIN,
+            revents: libc::POLLIN,
+        };
+
+        write_event(wfd, 1, 330, 1);
+        write_event(wfd, 3, 0, 300);
+        write_event(wfd, 3, 1, 200);
+        write_event(wfd, 2, 0, 5);
+        write_event(wfd, 2, 1, 5);
+
+        let handled = touch.handle_fd(&pfd, &adapter, &mut state, &zones, core_bounds, core_kb_bounds);
+        assert!(handled);
+        assert_eq!(touch.raw_x, 350);
+        assert_eq!(touch.raw_y, 250);
+        assert!(touch.is_touch_down);
+        assert!(touch.touch_moved);
+        assert_eq!(state.touch_count, 1);
+
+        touch.finish_poll_step(&adapter, &mut state, &zones, core_bounds, core_kb_bounds);
+        assert_eq!(state.touch_count, 1);
+        let expected_scaled = adapter.scale_touch(350, 250);
+        assert_eq!(state.last_touch_scaled, Some(CorePoint::new(expected_scaled.x, expected_scaled.y)));
+        assert!(!touch.touch_moved);
+
+        unsafe {
+            libc::close(rfd);
+            libc::close(wfd);
+        }
+    }
+
+    #[test]
+    fn test_evdev_rel_clamping_at_zero_and_32767() {
+        let (rfd, wfd, mut touch) = setup_test_pipe();
+        let adapter = super::super::adapter::DeviceAdapter::new();
+        let mut state = UiState::<256>::new();
+        let screen_bounds = Rectangle::new(Point::zero(), Size::new(800, 480));
+        let zones = LayoutZones::compute(screen_bounds, state.keyboard_visible);
+        let core_bounds = eg_rect_to_core(screen_bounds);
+        let core_kb_bounds = zones.keyboard_area.map(eg_rect_to_core);
+
+        let pfd = libc::pollfd {
+            fd: rfd,
+            events: libc::POLLIN,
+            revents: libc::POLLIN,
+        };
+
+        touch.raw_x = 100;
+        touch.raw_y = 100;
+
+        write_event(wfd, 2, 0, -5000);
+        write_event(wfd, 2, 1, -5000);
+        touch.handle_fd(&pfd, &adapter, &mut state, &zones, core_bounds, core_kb_bounds);
+        assert_eq!(touch.raw_x, 0);
+        assert_eq!(touch.raw_y, 0);
+
+        write_event(wfd, 2, 0, 5000);
+        write_event(wfd, 2, 1, 5000);
+        touch.handle_fd(&pfd, &adapter, &mut state, &zones, core_bounds, core_kb_bounds);
+        assert_eq!(touch.raw_x, 32767);
+        assert_eq!(touch.raw_y, 32767);
+
+        unsafe {
+            libc::close(rfd);
+            libc::close(wfd);
+        }
+    }
+}

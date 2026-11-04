@@ -69,3 +69,76 @@ impl DebugButton {
             .find(|b| b.rect().contains(p))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn header_button_fat_finger_vertical_tolerance_and_horizontal_gaps() {
+        // Spanning full 0..HEADER_HEIGHT despite DEBUG_BUTTON having y = 4, height = 28
+        assert_eq!(HeaderButton::at(Point::new(410, 0)), Some(HeaderButton::Debug));
+        assert_eq!(HeaderButton::at(Point::new(519, 0)), Some(HeaderButton::Debug));
+        assert_eq!(HeaderButton::at(Point::new(410, 35)), Some(HeaderButton::Debug));
+        assert_eq!(HeaderButton::at(Point::new(519, 35)), Some(HeaderButton::Debug));
+
+        // Outside vertical bounds
+        assert_eq!(HeaderButton::at(Point::new(450, -1)), None);
+        assert_eq!(HeaderButton::at(Point::new(450, 36)), None);
+
+        // Horizontal boundaries and 10px dead zones at y = 15
+        assert_eq!(HeaderButton::at(Point::new(409, 15)), None);
+        assert_eq!(HeaderButton::at(Point::new(410, 15)), Some(HeaderButton::Debug));
+        assert_eq!(HeaderButton::at(Point::new(519, 15)), Some(HeaderButton::Debug));
+        assert_eq!(HeaderButton::at(Point::new(520, 15)), None);
+        assert_eq!(HeaderButton::at(Point::new(529, 15)), None);
+
+        assert_eq!(HeaderButton::at(Point::new(530, 15)), Some(HeaderButton::Keyboard));
+        assert_eq!(HeaderButton::at(Point::new(649, 15)), Some(HeaderButton::Keyboard));
+        assert_eq!(HeaderButton::at(Point::new(650, 15)), None);
+        assert_eq!(HeaderButton::at(Point::new(659, 15)), None);
+
+        assert_eq!(HeaderButton::at(Point::new(660, 15)), Some(HeaderButton::Clear));
+        assert_eq!(HeaderButton::at(Point::new(779, 15)), Some(HeaderButton::Clear));
+        assert_eq!(HeaderButton::at(Point::new(780, 15)), None);
+    }
+
+    #[test]
+    fn debug_button_exact_rectangles_and_inter_button_gaps() {
+        // AuthUser: 287..396, 190..226
+        assert_eq!(DebugButton::at(Point::new(287, 190)), Some(DebugButton::AuthUser));
+        assert_eq!(DebugButton::at(Point::new(395, 190)), Some(DebugButton::AuthUser));
+        assert_eq!(DebugButton::at(Point::new(287, 225)), Some(DebugButton::AuthUser));
+        assert_eq!(DebugButton::at(Point::new(395, 225)), Some(DebugButton::AuthUser));
+
+        // StartJob: 404..513, 190..226
+        assert_eq!(DebugButton::at(Point::new(404, 190)), Some(DebugButton::StartJob));
+        assert_eq!(DebugButton::at(Point::new(512, 190)), Some(DebugButton::StartJob));
+        assert_eq!(DebugButton::at(Point::new(404, 225)), Some(DebugButton::StartJob));
+        assert_eq!(DebugButton::at(Point::new(512, 225)), Some(DebugButton::StartJob));
+
+        // StopJob: 287..396, 234..270
+        assert_eq!(DebugButton::at(Point::new(287, 234)), Some(DebugButton::StopJob));
+        assert_eq!(DebugButton::at(Point::new(395, 234)), Some(DebugButton::StopJob));
+        assert_eq!(DebugButton::at(Point::new(287, 269)), Some(DebugButton::StopJob));
+        assert_eq!(DebugButton::at(Point::new(395, 269)), Some(DebugButton::StopJob));
+
+        // Logout: 404..513, 234..270
+        assert_eq!(DebugButton::at(Point::new(404, 234)), Some(DebugButton::Logout));
+        assert_eq!(DebugButton::at(Point::new(512, 234)), Some(DebugButton::Logout));
+        assert_eq!(DebugButton::at(Point::new(404, 269)), Some(DebugButton::Logout));
+        assert_eq!(DebugButton::at(Point::new(512, 269)), Some(DebugButton::Logout));
+
+        // Exclusive right/bottom edges
+        assert_eq!(DebugButton::at(Point::new(396, 200)), None);
+        assert_eq!(DebugButton::at(Point::new(513, 200)), None);
+        assert_eq!(DebugButton::at(Point::new(300, 226)), None);
+        assert_eq!(DebugButton::at(Point::new(450, 226)), None);
+        assert_eq!(DebugButton::at(Point::new(300, 270)), None);
+        assert_eq!(DebugButton::at(Point::new(450, 270)), None);
+
+        // 8px horizontal gap (x = 400, y = 200) and 8px vertical gap (x = 300, y = 230)
+        assert_eq!(DebugButton::at(Point::new(400, 200)), None);
+        assert_eq!(DebugButton::at(Point::new(300, 230)), None);
+    }
+}

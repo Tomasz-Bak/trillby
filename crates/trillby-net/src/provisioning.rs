@@ -112,9 +112,11 @@ impl DeviceProvisioning {
         if path.len() >= path_buf.len() {
             return Err(ProvisioningError::IoError(libc::ENAMETOOLONG));
         }
+        if path.as_bytes().contains(&0) {
+            return Err(ProvisioningError::IoError(libc::EINVAL));
+        }
         path_buf[..path.len()].copy_from_slice(path.as_bytes());
         path_buf[path.len()] = 0;
-
         let fd = unsafe {
             libc::open(
                 path_buf.as_ptr() as *const libc::c_char,
@@ -162,6 +164,8 @@ impl DeviceProvisioning {
 #[cfg(test)]
 mod tests {
     use super::*;
+    extern crate std;
+    use std::format;
 
     #[test]
     fn test_crc32_ieee_known_vectors() {
@@ -200,5 +204,106 @@ mod tests {
             DeviceProvisioning::decode(&bad_magic),
             Err(ProvisioningError::InvalidMagic)
         );
+    }
+
+    #[test]
+    fn test_decode_short_and_unsupported_version() {
+        assert_eq!(
+            DeviceProvisioning::decode(&[0u8; DeviceProvisioning::LEN - 1]),
+            Err(ProvisioningError::BufferTooShort)
+        );
+
+        let creds = DeviceProvisioning {
+            device_uuid: [0x42; 16],
+            psk: [0x99; 32],
+            server_ip: [192, 168, 1, 50],
+            server_port: 8088,
+        };
+        let mut blob = [0u8; DeviceProvisioning::LEN];
+        creds.encode(&mut blob);
+
+        // Version 0
+        let mut v0_blob = blob;
+        v0_blob[4] = 0;
+        assert_eq!(
+            DeviceProvisioning::decode(&v0_blob),
+            Err(ProvisioningError::UnsupportedVersion)
+        );
+
+        // Version 2
+        let mut v2_blob = blob;
+        v2_blob[4] = 2;
+        assert_eq!(
+            DeviceProvisioning::decode(&v2_blob),
+            Err(ProvisioningError::UnsupportedVersion)
+        );
+    }
+
+    #[test]
+    fn test_load_from_file_lifecycle_and_errors() {
+        let creds = DeviceProvisioning {
+            device_uuid: [0x11; 16],
+            psk: [0x22; 32],
+            server_ip: [10, 0, 0, 1],
+            server_port: 9000,
+        };
+        let mut blob = [0u8; DeviceProvisioning::LEN];
+        creds.encode(&mut blob);
+
+        let pid = std::process::id();
+        let valid_path = format!("/tmp/trillby_prov_test_{}_valid.bin", pid);
+        let trunc_path = format!("/tmp/trillby_prov_test_{}_trunc.bin", pid);
+        let corrupt_path = format!("/tmp/trillby_prov_test_{}_corrupt.bin", pid);
+        let missing_path = format!("/tmp/trillby_prov_test_{}_missing.bin", pid);
+
+        // Clean up any stale files
+        let _ = std::fs::remove_file(&valid_path);
+        let _ = std::fs::remove_file(&trunc_path);
+        let _ = std::fs::remove_file(&corrupt_path);
+        let _ = std::fs::remove_file(&missing_path);
+
+        std::fs::write(&valid_path, &blob).expect("write valid prov blob");
+
+        // 1. Valid load
+        let loaded = DeviceProvisioning::load_from_file(&valid_path).expect("load valid blob");
+        assert_eq!(loaded, creds);
+
+        // 2. Missing file
+        assert_eq!(
+            DeviceProvisioning::load_from_file(&missing_path),
+            Err(ProvisioningError::IoError(libc::ENOENT))
+        );
+
+        // 3. Path >= 256 bytes
+        let long_path = "a".repeat(256);
+        assert_eq!(
+            DeviceProvisioning::load_from_file(&long_path),
+            Err(ProvisioningError::IoError(libc::ENAMETOOLONG))
+        );
+
+        // 4. Truncated 62-byte file
+        std::fs::write(&trunc_path, &blob[..62]).expect("write truncated prov blob");
+        assert_eq!(
+            DeviceProvisioning::load_from_file(&trunc_path),
+            Err(ProvisioningError::BufferTooShort)
+        );
+
+        // 5. Corrupted CRC file
+        let mut corrupted_blob = blob;
+        corrupted_blob[10] ^= 0x01;
+        std::fs::write(&corrupt_path, &corrupted_blob).expect("write corrupt prov blob");
+        assert_eq!(
+            DeviceProvisioning::load_from_file(&corrupt_path),
+            Err(ProvisioningError::ChecksumMismatch)
+        );
+
+        // 6. Path with interior NUL byte: must be rejected with Err rather than silently opening valid_path
+        let nul_path = format!("{}\0/trailing", valid_path);
+        assert!(DeviceProvisioning::load_from_file(&nul_path).is_err());
+
+        // Cleanup
+        let _ = std::fs::remove_file(&valid_path);
+        let _ = std::fs::remove_file(&trunc_path);
+        let _ = std::fs::remove_file(&corrupt_path);
     }
 }

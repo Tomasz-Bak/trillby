@@ -85,3 +85,43 @@ pub(crate) fn hex<const N: usize>(s: &str) -> [u8; N] {
     assert!(n == N && hi.is_none(), "hex length mismatch");
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_constant_time_eq_edge_cases() {
+        assert!(constant_time_eq(&[], &[]));
+        assert!(!constant_time_eq(&[1, 2], &[1, 2, 3]));
+        assert!(!constant_time_eq(&[1, 2, 3], &[1, 2]));
+        assert!(constant_time_eq(&[1, 2, 3], &[1, 2, 3]));
+
+        // 1-bit flip at first byte
+        let a = [0x42, 0x55, 0xaa];
+        let mut b = a;
+        b[0] ^= 0x01;
+        assert!(!constant_time_eq(&a, &b));
+
+        // 1-bit flip at middle byte
+        let mut c = a;
+        c[1] ^= 0x01;
+        assert!(!constant_time_eq(&a, &c));
+
+        // 1-bit flip at last byte
+        let mut d = a;
+        d[2] ^= 0x01;
+        assert!(!constant_time_eq(&a, &d));
+    }
+
+    #[test]
+    fn test_wipe_zeroes_memory() {
+        let mut byte_buf = [0x5au8; 32];
+        wipe(&mut byte_buf);
+        assert_eq!(byte_buf, [0u8; 32]);
+
+        let mut u32_buf = [0x12345678u32; 8];
+        wipe(&mut u32_buf);
+        assert_eq!(u32_buf, [0u32; 8]);
+    }
+}

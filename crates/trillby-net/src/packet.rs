@@ -216,6 +216,16 @@ pub struct FrameHeader {
     pub flags: u16,
 }
 
+/// Which peer sealed an AEAD frame; mixed into the nonce so the two directions never share a keystream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction { ClientToServer, ServerToClient }
+
+/// FrameHeader.flags bit 0: frame was sealed by the client.
+pub const FLAG_CLIENT_TO_SERVER: u16 = 0x0001;
+/// XORed into nonce byte 0 for client->server frames.
+const C2S_NONCE_MASK: u8 = 0x80;
+
+
 impl FrameHeader {
     pub fn new(msg_type: MsgType, session_id: u32, seq_num: u32, payload_len: u16) -> Self {
         Self {
@@ -269,13 +279,24 @@ impl FrameHeader {
         })
     }
 
-    /// Derive standard 12-byte AEAD nonce: [salt (4B) || session_id (4B) || seq_num (4B)]
+    pub fn direction(&self) -> Direction {
+        if self.flags & FLAG_CLIENT_TO_SERVER != 0 {
+            Direction::ClientToServer
+        } else {
+            Direction::ServerToClient
+        }
+    }
+
+    /// Derive standard 12-byte AEAD nonce: [salt ^ dir (4B) || session_id LE (4B) || seq_num LE (4B)], dir = 0x80 in byte 0 for client->server
     pub fn derive_nonce(&self, salt: &[u8; 4]) -> [u8; 12] {
         let mut nonce = [0u8; 12];
         let mut w = ByteWriter::new(&mut nonce);
         let _ = w.write_bytes(salt);
         let _ = w.write_u32_le(self.session_id);
         let _ = w.write_u32_le(self.seq_num);
+        if self.direction() == Direction::ClientToServer {
+            nonce[0] ^= C2S_NONCE_MASK;
+        }
         nonce
     }
 }
@@ -360,6 +381,9 @@ impl AuthInitPayload {
     pub fn decode(bytes: &[u8]) -> Result<Self, PacketError> {
         let mut r = ByteReader::new(bytes);
         let auth_data_len = r.read_u8()?;
+        if auth_data_len > 32 {
+            return Err(PacketError::InvalidPayload);
+        }
         let auth_data = r.read_array::<32>()?;
         let timestamp_ms = r.read_u64_le()?;
         Ok(Self {
@@ -695,12 +719,14 @@ pub fn generate_client_nonce(
 // ===========================================================================
 // Full Frame Serialization & In-Place AEAD Encryption
 // ===========================================================================
-
 /// Assemble and encrypt a packet frame into `frame_buf`.
+/// `direction` sets `FLAG_CLIENT_TO_SERVER` in the (authenticated) header for
+/// client->server frames, which also selects the direction-specific nonce.
 /// Returns total frame length (16-byte header + ciphertext + 16-byte MAC tag).
-pub fn pack_and_encrypt(
+pub fn pack_and_encrypt_directed(
     key: &[u8; 32],
     salt: &[u8; 4],
+    direction: Direction,
     msg_type: MsgType,
     session_id: u32,
     seq_num: u32,
@@ -713,7 +739,10 @@ pub fn pack_and_encrypt(
         return Err(PacketError::PayloadTooLarge);
     }
 
-    let header = FrameHeader::new(msg_type, session_id, seq_num, payload_len as u16);
+    let mut header = FrameHeader::new(msg_type, session_id, seq_num, payload_len as u16);
+    if direction == Direction::ClientToServer {
+        header.flags |= FLAG_CLIENT_TO_SERVER;
+    }
     let mut header_bytes = [0u8; HEADER_LEN];
     header.encode(&mut header_bytes);
 
@@ -727,6 +756,28 @@ pub fn pack_and_encrypt(
         .map_err(|_| PacketError::PayloadTooLarge)?;
 
     Ok(total_len)
+}
+
+/// Seal a server->client frame.
+pub fn pack_and_encrypt(
+    key: &[u8; 32],
+    salt: &[u8; 4],
+    msg_type: MsgType,
+    session_id: u32,
+    seq_num: u32,
+    plaintext: &[u8],
+    frame_buf: &mut [u8],
+) -> Result<usize, PacketError> {
+    pack_and_encrypt_directed(
+        key,
+        salt,
+        Direction::ServerToClient,
+        msg_type,
+        session_id,
+        seq_num,
+        plaintext,
+        frame_buf,
+    )
 }
 
 /// Verify MAC and decrypt an incoming frame in place.
@@ -1093,5 +1144,251 @@ mod tests {
             valid.encode(&mut short_out),
             Err(PacketError::BufferTooShort)
         );
+    }
+
+    #[test]
+    fn test_frame_header_decode_all_error_variants() {
+        let valid_hdr = FrameHeader::new(MsgType::Data, 1234, 5678, 100);
+        let mut bytes = [0u8; HEADER_LEN];
+        valid_hdr.encode(&mut bytes);
+
+        // < 16 bytes
+        assert_eq!(FrameHeader::decode(&bytes[..15]), Err(PacketError::BufferTooShort));
+
+        // Bad magic
+        let mut bad_magic = bytes;
+        bad_magic[0] ^= 0xff;
+        assert_eq!(FrameHeader::decode(&bad_magic), Err(PacketError::InvalidMagic));
+
+        // Version 0 or 2
+        let mut v0 = bytes;
+        v0[2] = 0;
+        assert_eq!(FrameHeader::decode(&v0), Err(PacketError::UnsupportedVersion));
+        let mut v2 = bytes;
+        v2[2] = 2;
+        assert_eq!(FrameHeader::decode(&v2), Err(PacketError::UnsupportedVersion));
+
+        // Unknown msg_type 0x00 / 0x99
+        let mut unk0 = bytes;
+        unk0[3] = 0x00;
+        assert_eq!(FrameHeader::decode(&unk0), Err(PacketError::UnknownMsgType));
+        let mut unk99 = bytes;
+        unk99[3] = 0x99;
+        assert_eq!(FrameHeader::decode(&unk99), Err(PacketError::UnknownMsgType));
+
+        // payload_len = 241 (> MAX_PAYLOAD_LEN = 240)
+        let mut large_payload = bytes;
+        large_payload[12..14].copy_from_slice(&241u16.to_le_bytes());
+        assert_eq!(FrameHeader::decode(&large_payload), Err(PacketError::PayloadTooLarge));
+    }
+
+    #[test]
+    fn test_all_payloads_short_buffers_and_auth_init_length_validation() {
+        // HandshakeInitPayload (LEN = 48)
+        let init = HandshakeInitPayload {
+            client_nonce: [0x11; 32],
+            device_uuid: [0x22; 16],
+        };
+        let mut short_init = [0u8; HandshakeInitPayload::LEN - 1];
+        assert_eq!(init.encode(&mut short_init), Err(PacketError::BufferTooShort));
+        assert_eq!(HandshakeInitPayload::decode(&short_init), Err(PacketError::BufferTooShort));
+
+        // HandshakeRespPayload (LEN = 40)
+        let resp = HandshakeRespPayload {
+            server_nonce: [0x33; 32],
+            assigned_session_id: 100,
+            session_salt: [1, 2, 3, 4],
+        };
+        let mut short_resp = [0u8; HandshakeRespPayload::LEN - 1];
+        assert_eq!(resp.encode(&mut short_resp), Err(PacketError::BufferTooShort));
+        assert_eq!(HandshakeRespPayload::decode(&short_resp), Err(PacketError::BufferTooShort));
+
+        // AuthInitPayload (LEN = 41)
+        let auth_init = AuthInitPayload {
+            auth_data_len: 16,
+            auth_data: [0x44; 32],
+            timestamp_ms: 1000,
+        };
+        let mut short_auth_init = [0u8; AuthInitPayload::LEN - 1];
+        assert_eq!(auth_init.encode(&mut short_auth_init), Err(PacketError::BufferTooShort));
+        assert_eq!(AuthInitPayload::decode(&short_auth_init), Err(PacketError::BufferTooShort));
+
+        // AuthRespPayload (LEN = 6)
+        let auth_resp = AuthRespPayload {
+            status: 0,
+            role: 1,
+            session_ttl_s: 3600,
+        };
+        let mut short_auth_resp = [0u8; AuthRespPayload::LEN - 1];
+        assert_eq!(auth_resp.encode(&mut short_auth_resp), Err(PacketError::BufferTooShort));
+        assert_eq!(AuthRespPayload::decode(&short_auth_resp), Err(PacketError::BufferTooShort));
+
+        // HeartbeatPayload (LEN = 8)
+        let hb = HeartbeatPayload {
+            battery_pct: 95,
+            rssi: -60,
+            pending_outbox: 3,
+            uptime_s: 500,
+        };
+        let mut short_hb = [0u8; HeartbeatPayload::LEN - 1];
+        assert_eq!(hb.encode(&mut short_hb), Err(PacketError::BufferTooShort));
+        assert_eq!(HeartbeatPayload::decode(&short_hb), Err(PacketError::BufferTooShort));
+
+        // AckPayload (LEN = 5)
+        let ack = AckPayload {
+            acked_seq: 1,
+            status: 0,
+        };
+        let mut short_ack = [0u8; AckPayload::LEN - 1];
+        assert_eq!(ack.encode(&mut short_ack), Err(PacketError::BufferTooShort));
+        assert_eq!(AckPayload::decode(&short_ack), Err(PacketError::BufferTooShort));
+
+        // AuthInitPayload::decode with auth_data_len > 32 must return Err(PacketError::InvalidPayload)
+        let mut valid_auth_buf = [0u8; AuthInitPayload::LEN];
+        auth_init.encode(&mut valid_auth_buf).unwrap();
+
+        let mut buf_33 = valid_auth_buf;
+        buf_33[0] = 33;
+        assert_eq!(AuthInitPayload::decode(&buf_33), Err(PacketError::InvalidPayload));
+
+        let mut buf_255 = valid_auth_buf;
+        buf_255[0] = 255;
+        assert_eq!(AuthInitPayload::decode(&buf_255), Err(PacketError::InvalidPayload));
+    }
+
+    #[test]
+    fn test_hmac_and_aead_frame_boundary_and_mismatch_errors() {
+        let key = [0x55u8; 32];
+        let salt = [0x11, 0x22, 0x33, 0x44];
+        let mut frame_buf = [0u8; MAX_FRAME_LEN];
+
+        // 1. HMAC boundary:
+        // Exact max payload: 208 bytes + 32 tag = 240 bytes payload (total 256 bytes) -> Ok(256)
+        let payload_208 = [0xAAu8; 208];
+        let res_208 = pack_and_authenticate_hmac(
+            &key,
+            MsgType::HandshakeInit,
+            0,
+            0,
+            &payload_208,
+            &mut frame_buf,
+        );
+        assert_eq!(res_208, Ok(MAX_FRAME_LEN));
+
+        // 209 bytes payload -> 209 + 32 = 241 > MAX_PAYLOAD_LEN -> Err(PacketError::PayloadTooLarge)
+        let payload_209 = [0xAAu8; 209];
+        let res_209 = pack_and_authenticate_hmac(
+            &key,
+            MsgType::HandshakeInit,
+            0,
+            0,
+            &payload_209,
+            &mut frame_buf,
+        );
+        assert_eq!(res_209, Err(PacketError::PayloadTooLarge));
+
+        // verify_and_unpack_hmac:
+        // Truncated frame_buf (< HEADER_LEN + HMAC_TAG_LEN)
+        assert_eq!(
+            verify_and_unpack_hmac(&key, &frame_buf[..HEADER_LEN + HMAC_TAG_LEN - 1]),
+            Err(PacketError::BufferTooShort)
+        );
+        // header.payload_len < HMAC_TAG_LEN (e.g. 31)
+        let mut bad_len_frame = [0u8; HEADER_LEN + HMAC_TAG_LEN];
+        let bad_hdr = FrameHeader::new(MsgType::HandshakeInit, 0, 0, (HMAC_TAG_LEN - 1) as u16);
+        let mut hdr_bytes = [0u8; HEADER_LEN];
+        bad_hdr.encode(&mut hdr_bytes);
+        bad_len_frame[..HEADER_LEN].copy_from_slice(&hdr_bytes);
+        assert_eq!(
+            verify_and_unpack_hmac(&key, &bad_len_frame),
+            Err(PacketError::BufferTooShort)
+        );
+
+        // 2. AEAD boundary:
+        // Exact max plaintext: 224 bytes + 16 tag = 240 bytes payload (total 256 bytes) -> Ok(256)
+        let pt_224 = [0xBBu8; 224];
+        let res_224 = pack_and_encrypt(
+            &key,
+            &salt,
+            MsgType::Data,
+            1,
+            1,
+            &pt_224,
+            &mut frame_buf,
+        );
+        assert_eq!(res_224, Ok(MAX_FRAME_LEN));
+
+        // 225 bytes plaintext -> 225 + 16 = 241 > MAX_PAYLOAD_LEN -> Err(PacketError::PayloadTooLarge)
+        let pt_225 = [0xBBu8; 225];
+        let res_225 = pack_and_encrypt(
+            &key,
+            &salt,
+            MsgType::Data,
+            1,
+            1,
+            &pt_225,
+            &mut frame_buf,
+        );
+        assert_eq!(res_225, Err(PacketError::PayloadTooLarge));
+
+        // decrypt_and_unpack:
+        let valid_frame = frame_buf;
+        let mut wrong_salt_frame = valid_frame;
+        let mut wrong_salt = salt;
+        wrong_salt[0] ^= 1;
+        assert_eq!(
+            decrypt_and_unpack(&key, &wrong_salt, &mut wrong_salt_frame),
+            Err(PacketError::DecryptionFailed)
+        );
+
+        let mut wrong_key_frame = valid_frame;
+        let mut wrong_key = key;
+        wrong_key[0] ^= 1;
+        assert_eq!(
+            decrypt_and_unpack(&wrong_key, &salt, &mut wrong_key_frame),
+            Err(PacketError::DecryptionFailed)
+        );
+
+        // header.payload_len < TAG_LEN (e.g. 15)
+        let mut short_payload_hdr_frame = [0u8; HEADER_LEN + TAG_LEN];
+        let short_hdr = FrameHeader::new(MsgType::Data, 1, 1, (TAG_LEN - 1) as u16);
+        let mut short_hdr_bytes = [0u8; HEADER_LEN];
+        short_hdr.encode(&mut short_hdr_bytes);
+        short_payload_hdr_frame[..HEADER_LEN].copy_from_slice(&short_hdr_bytes);
+        assert_eq!(
+            decrypt_and_unpack(&key, &salt, &mut short_payload_hdr_frame),
+            Err(PacketError::BufferTooShort)
+        );
+    }
+
+    #[test]
+    fn test_derive_session_key_input_sensitivity() {
+        let psk = [0x55u8; 32];
+        let salt = [1, 2, 3, 4];
+        let client_nonce = [0x11u8; 32];
+        let server_nonce = [0x22u8; 32];
+
+        let base_key = derive_session_key(&psk, &salt, &client_nonce, &server_nonce);
+        assert_ne!(base_key, [0u8; 32]);
+
+        // Flip 1 bit in psk
+        let mut diff_psk = psk;
+        diff_psk[0] ^= 0x01;
+        assert_ne!(derive_session_key(&diff_psk, &salt, &client_nonce, &server_nonce), base_key);
+
+        // Flip 1 bit in salt
+        let mut diff_salt = salt;
+        diff_salt[0] ^= 0x01;
+        assert_ne!(derive_session_key(&psk, &diff_salt, &client_nonce, &server_nonce), base_key);
+
+        // Flip 1 bit in client_nonce
+        let mut diff_client_nonce = client_nonce;
+        diff_client_nonce[0] ^= 0x01;
+        assert_ne!(derive_session_key(&psk, &salt, &diff_client_nonce, &server_nonce), base_key);
+
+        // Flip 1 bit in server_nonce
+        let mut diff_server_nonce = server_nonce;
+        diff_server_nonce[0] ^= 0x01;
+        assert_ne!(derive_session_key(&psk, &salt, &client_nonce, &diff_server_nonce), base_key);
     }
 }

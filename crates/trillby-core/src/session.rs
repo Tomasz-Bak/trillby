@@ -57,10 +57,23 @@ fn to_bounded_string<const CAP: usize>(s: &str) -> String<CAP> {
     out
 }
 
+/// FNV-1a over the full, untruncated identifier so ids sharing the stored
+/// (truncated) prefix still compare distinct.
+fn identifier_key(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in s.as_bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperatorSession {
     state: SessionState,
     events: Vec<SessionEvent, 8>,
+    operator_key: u64,
+    job_key: u64,
 }
 
 impl Default for OperatorSession {
@@ -74,6 +87,8 @@ impl OperatorSession {
         Self {
             state: SessionState::Idle,
             events: Vec::new(),
+            operator_key: 0,
+            job_key: 0,
         }
     }
 
@@ -92,6 +107,8 @@ impl OperatorSession {
     pub fn clear(&mut self) {
         self.state = SessionState::Idle;
         self.events.clear();
+        self.operator_key = 0;
+        self.job_key = 0;
     }
 
     fn enqueue(&mut self, event: SessionEvent) {
@@ -103,8 +120,10 @@ impl OperatorSession {
 
     pub fn handle_rfid(&mut self, badge: &str, tick: u64) {
         let badge_id: String<32> = to_bounded_string(badge);
+        let badge_key = identifier_key(badge);
         match &self.state {
             SessionState::Idle => {
+                self.operator_key = badge_key;
                 self.state = SessionState::Authenticated {
                     operator_id: badge_id.clone(),
                 };
@@ -115,13 +134,16 @@ impl OperatorSession {
             }
             SessionState::Authenticated { operator_id } => {
                 let old_op = operator_id.clone();
-                if badge_id == old_op {
+                let same_op = badge_id == old_op && badge_key == self.operator_key;
+                if same_op {
+                    self.operator_key = 0;
                     self.state = SessionState::Idle;
                     self.enqueue(SessionEvent::OperatorLogout {
                         operator_id: old_op,
                         tick,
                     });
                 } else {
+                    self.operator_key = badge_key;
                     self.state = SessionState::Authenticated {
                         operator_id: badge_id.clone(),
                     };
@@ -146,6 +168,7 @@ impl OperatorSession {
                 let duration_ms = tick
                     .saturating_sub(start_tick)
                     .saturating_mul(crate::POLL_TIMEOUT_MS as u64);
+                let same_op = badge_id == old_op && badge_key == self.operator_key;
 
                 self.enqueue(SessionEvent::WorkStop {
                     operator_id: old_op.clone(),
@@ -155,13 +178,17 @@ impl OperatorSession {
                     duration_ms,
                 });
 
-                if badge_id == old_op {
+                if same_op {
+                    self.operator_key = 0;
+                    self.job_key = 0;
                     self.state = SessionState::Idle;
                     self.enqueue(SessionEvent::OperatorLogout {
                         operator_id: old_op,
                         tick,
                     });
                 } else {
+                    self.operator_key = badge_key;
+                    self.job_key = 0;
                     self.state = SessionState::Authenticated {
                         operator_id: badge_id.clone(),
                     };
@@ -184,6 +211,7 @@ impl OperatorSession {
             SessionState::Idle => Err(SessionRejectReason::NotAuthenticated),
             SessionState::Authenticated { operator_id } => {
                 let op_id = operator_id.clone();
+                self.job_key = identifier_key(code);
                 self.state = SessionState::Working {
                     operator_id: op_id.clone(),
                     job_id: code_id.clone(),
@@ -201,7 +229,7 @@ impl OperatorSession {
                 job_id,
                 started_at_tick,
             } => {
-                if code_id == *job_id {
+                if code_id == *job_id && identifier_key(code) == self.job_key {
                     let op_id = operator_id.clone();
                     let active_job = job_id.clone();
                     let start_tick = *started_at_tick;
@@ -209,6 +237,7 @@ impl OperatorSession {
                         .saturating_sub(start_tick)
                         .saturating_mul(crate::POLL_TIMEOUT_MS as u64);
 
+                    self.job_key = 0;
                     self.state = SessionState::Authenticated {
                         operator_id: op_id.clone(),
                     };
@@ -227,11 +256,12 @@ impl OperatorSession {
         }
     }
 
-
     pub fn force_authenticate(&mut self, badge: &str, tick: u64) -> bool {
         let badge_id: String<32> = to_bounded_string(badge);
+        let badge_key = identifier_key(badge);
         match &self.state {
             SessionState::Idle => {
+                self.operator_key = badge_key;
                 self.state = SessionState::Authenticated {
                     operator_id: badge_id.clone(),
                 };
@@ -242,10 +272,12 @@ impl OperatorSession {
                 true
             }
             SessionState::Authenticated { operator_id } => {
-                if *operator_id == badge_id {
+                let same_op = *operator_id == badge_id && badge_key == self.operator_key;
+                if same_op {
                     false
                 } else {
                     let old_op = operator_id.clone();
+                    self.operator_key = badge_key;
                     self.state = SessionState::Authenticated {
                         operator_id: badge_id.clone(),
                     };
@@ -271,7 +303,10 @@ impl OperatorSession {
                 let duration_ms = tick
                     .saturating_sub(start_tick)
                     .saturating_mul(crate::POLL_TIMEOUT_MS as u64);
+                let same_op = old_op == badge_id && badge_key == self.operator_key;
 
+                self.operator_key = badge_key;
+                self.job_key = 0;
                 self.state = SessionState::Authenticated {
                     operator_id: badge_id.clone(),
                 };
@@ -282,7 +317,7 @@ impl OperatorSession {
                     stopped_at_tick: tick,
                     duration_ms,
                 });
-                if old_op != badge_id {
+                if !same_op {
                     self.enqueue(SessionEvent::OperatorLogout {
                         operator_id: old_op,
                         tick,
@@ -302,6 +337,8 @@ impl OperatorSession {
         match &self.state {
             SessionState::Idle => {
                 let op_id: String<32> = to_bounded_string(default_badge);
+                self.operator_key = identifier_key(default_badge);
+                self.job_key = identifier_key(code);
                 self.state = SessionState::Working {
                     operator_id: op_id.clone(),
                     job_id: code_id.clone(),
@@ -320,6 +357,7 @@ impl OperatorSession {
             }
             SessionState::Authenticated { operator_id } => {
                 let op_id = operator_id.clone();
+                self.job_key = identifier_key(code);
                 self.state = SessionState::Working {
                     operator_id: op_id.clone(),
                     job_id: code_id.clone(),
@@ -335,6 +373,7 @@ impl OperatorSession {
             SessionState::Working { .. } => false,
         }
     }
+
     pub fn force_stop_job(&mut self, tick: u64) -> bool {
         match &self.state {
             SessionState::Working {
@@ -349,6 +388,7 @@ impl OperatorSession {
                     .saturating_sub(start_tick)
                     .saturating_mul(crate::POLL_TIMEOUT_MS as u64);
 
+                self.job_key = 0;
                 self.state = SessionState::Authenticated {
                     operator_id: op_id.clone(),
                 };
@@ -370,6 +410,8 @@ impl OperatorSession {
             SessionState::Idle => false,
             SessionState::Authenticated { operator_id } => {
                 let op_id = operator_id.clone();
+                self.operator_key = 0;
+                self.job_key = 0;
                 self.state = SessionState::Idle;
                 self.enqueue(SessionEvent::OperatorLogout {
                     operator_id: op_id,
@@ -388,7 +430,8 @@ impl OperatorSession {
                 let duration_ms = tick
                     .saturating_sub(start_tick)
                     .saturating_mul(crate::POLL_TIMEOUT_MS as u64);
-
+                self.operator_key = 0;
+                self.job_key = 0;
                 self.state = SessionState::Idle;
                 self.enqueue(SessionEvent::WorkStop {
                     operator_id: op_id.clone(),
@@ -877,5 +920,183 @@ mod tests {
             })
         );
         assert_eq!(session.pop_event(), None);
+    }
+    #[test]
+    fn event_queue_capacity_8_fifo_and_oldest_eviction_on_overflow() {
+        let mut session = OperatorSession::new();
+
+        // 1. handle_rfid("OP_1", 10) -> 1 event (OperatorLogin(OP_1))
+        session.handle_rfid("OP_1", 10);
+
+        // 2. handle_rfid("OP_2", 20) -> +2 events (OperatorLogout(OP_1), OperatorLogin(OP_2); total 3)
+        session.handle_rfid("OP_2", 20);
+
+        // 3. handle_barcode("JOB_1", 30) -> +1 event (WorkStart(OP_2, JOB_1); total 4)
+        assert!(session.handle_barcode("JOB_1", 30).is_ok());
+
+        // 4. handle_rfid("OP_3", 40) -> +3 events (WorkStop(OP_2, JOB_1), OperatorLogout(OP_2), OperatorLogin(OP_3); total 7)
+        session.handle_rfid("OP_3", 40);
+
+        // 5. handle_barcode("JOB_2", 50) -> +1 event (WorkStart(OP_3, JOB_2); total 8, full)
+        assert!(session.handle_barcode("JOB_2", 50).is_ok());
+
+        // 6. handle_rfid("OP_4", 60) -> +3 events (WorkStop(OP_3, JOB_2), OperatorLogout(OP_3), OperatorLogin(OP_4)),
+        // evicting the 3 oldest events (OperatorLogin(OP_1), OperatorLogout(OP_1), OperatorLogin(OP_2)).
+        session.handle_rfid("OP_4", 60);
+
+        let dt = crate::POLL_TIMEOUT_MS as u64;
+
+        // Drain all events with pop_event() and assert exact 8-event FIFO sequence
+        assert_eq!(
+            session.pop_event(),
+            Some(SessionEvent::WorkStart {
+                operator_id: s32("OP_2"),
+                job_id: s64("JOB_1"),
+                started_at_tick: 30,
+            })
+        );
+        assert_eq!(
+            session.pop_event(),
+            Some(SessionEvent::WorkStop {
+                operator_id: s32("OP_2"),
+                job_id: s64("JOB_1"),
+                started_at_tick: 30,
+                stopped_at_tick: 40,
+                duration_ms: 10 * dt,
+            })
+        );
+        assert_eq!(
+            session.pop_event(),
+            Some(SessionEvent::OperatorLogout {
+                operator_id: s32("OP_2"),
+                tick: 40,
+            })
+        );
+        assert_eq!(
+            session.pop_event(),
+            Some(SessionEvent::OperatorLogin {
+                operator_id: s32("OP_3"),
+                tick: 40,
+            })
+        );
+        assert_eq!(
+            session.pop_event(),
+            Some(SessionEvent::WorkStart {
+                operator_id: s32("OP_3"),
+                job_id: s64("JOB_2"),
+                started_at_tick: 50,
+            })
+        );
+        assert_eq!(
+            session.pop_event(),
+            Some(SessionEvent::WorkStop {
+                operator_id: s32("OP_3"),
+                job_id: s64("JOB_2"),
+                started_at_tick: 50,
+                stopped_at_tick: 60,
+                duration_ms: 10 * dt,
+            })
+        );
+        assert_eq!(
+            session.pop_event(),
+            Some(SessionEvent::OperatorLogout {
+                operator_id: s32("OP_3"),
+                tick: 60,
+            })
+        );
+        assert_eq!(
+            session.pop_event(),
+            Some(SessionEvent::OperatorLogin {
+                operator_id: s32("OP_4"),
+                tick: 60,
+            })
+        );
+        assert_eq!(session.pop_event(), None);
+    }
+
+    #[test]
+    fn duration_ms_non_monotonic_tick_and_u64_max_saturation() {
+        let mut session = OperatorSession::new();
+        session.handle_rfid("OP_1", 10);
+        assert!(session.handle_barcode("JOB_1", 100).is_ok());
+        let _ = session.pop_event();
+        let _ = session.pop_event();
+
+        // Non-monotonic tick: stopped at tick 50 < started at tick 100
+        assert!(session.handle_barcode("JOB_1", 50).is_ok());
+        assert_eq!(
+            session.pop_event(),
+            Some(SessionEvent::WorkStop {
+                operator_id: s32("OP_1"),
+                job_id: s64("JOB_1"),
+                started_at_tick: 100,
+                stopped_at_tick: 50,
+                duration_ms: 0,
+            })
+        );
+
+        // Saturation at u64::MAX
+        session.clear();
+        session.handle_rfid("OP_1", 0);
+        assert!(session.handle_barcode("JOB_MAX", 0).is_ok());
+        let _ = session.pop_event();
+        let _ = session.pop_event();
+
+        assert!(session.handle_barcode("JOB_MAX", u64::MAX).is_ok());
+        assert_eq!(
+            session.pop_event(),
+            Some(SessionEvent::WorkStop {
+                operator_id: s32("OP_1"),
+                job_id: s64("JOB_MAX"),
+                started_at_tick: 0,
+                stopped_at_tick: u64::MAX,
+                duration_ms: u64::MAX,
+            })
+        );
+    }
+
+    #[test]
+    fn multibyte_utf8_truncation_and_distinct_overlong_identifiers() {
+        let mut session = OperatorSession::new();
+
+        // 15 "é" characters (30 bytes) + 1 '🦀' (4 bytes) = 34 bytes
+        let badge_multi = "ééééééééééééééé🦀";
+        let expected_multi = "ééééééééééééééé";
+        session.handle_rfid(badge_multi, 1);
+        match session.state() {
+            SessionState::Authenticated { operator_id } => {
+                assert_eq!(operator_id.as_str(), expected_multi);
+            }
+            other => panic!("expected Authenticated state, got {:?}", other),
+        }
+
+        // Two distinct 33-character badges sharing a 32-byte prefix:
+        // "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA1" vs "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA2"
+        let badge_a = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA1";
+        let badge_b = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA2";
+
+        session.clear();
+        session.handle_rfid(badge_a, 1);
+        session.handle_rfid(badge_b, 2);
+        // badge_b must NOT treat badge_b as a same-operator logout to SessionState::Idle
+        assert_ne!(
+            session.state(),
+            &SessionState::Idle,
+            "badge_b with distinct 33rd char was falsely treated as same-operator logout"
+        );
+
+        // Two distinct 65-character jobs sharing a 64-byte prefix:
+        // 64 'J's followed by '1' vs '2'
+        let job_a = "JJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJ1";
+        let job_b = "JJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJ2";
+
+        session.clear();
+        session.handle_rfid("OP_1", 1);
+        assert!(session.handle_barcode(job_a, 2).is_ok());
+        assert_eq!(
+            session.handle_barcode(job_b, 3),
+            Err(SessionRejectReason::JobMismatch),
+            "job_b with distinct 65th char was falsely accepted as matching active job"
+        );
     }
 }

@@ -59,6 +59,7 @@ impl UiRenderer {
     where
         D: DrawTarget<Color = Rgb565>,
     {
+        let target = &mut target.clipped(&self.screen_bounds);
         // Compute 2-State Responsive Layout Zones (Keyboard Hidden vs Active)
         let zones = LayoutZones::compute(self.screen_bounds, state.keyboard_visible);
 
@@ -83,7 +84,7 @@ impl UiRenderer {
         // Header Network Status Badge
         let (badge_label, badge_variant) = match state.network_status {
             trillby_core::net_types::NetworkStatus::Online => ("ONLINE", BadgeVariant::Success),
-            trillby_core::net_types::NetworkStatus::Offline => ("OFFLINE", BadgeVariant::Danger),
+            trillby_core::net_types::NetworkStatus::Offline => ("OFFLINE", BadgeVariant::Warning),
             trillby_core::net_types::NetworkStatus::Connecting => ("LINKING", BadgeVariant::Warning),
             trillby_core::net_types::NetworkStatus::Handshaking => ("AUTH", BadgeVariant::Warning),
             trillby_core::net_types::NetworkStatus::Syncing(_) => ("SYNC", BadgeVariant::Info),
@@ -475,6 +476,7 @@ impl UiRenderer {
             .title("SYSTEM EVENT STREAM")
             .draw(target, &self.theme)?;
 
+        let mut content = target.clipped(&bounds);
         let text_muted = MonoTextStyle::new(&FONT_6X12, self.theme.text_muted());
         let max_log_items = (bounds.size.height.saturating_sub(40) / 14) as usize;
         for (i, entry) in state.event_history.iter().enumerate().take(max_log_items.min(6)) {
@@ -485,7 +487,7 @@ impl UiRenderer {
                     Point::new(bounds.top_left.x + 12, y_pos),
                     text_muted,
                 )
-                .draw(target)?;
+                .draw(&mut content)?;
             }
         }
 
@@ -496,40 +498,115 @@ impl UiRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use embedded_graphics::mock_display::MockDisplay;
+    extern crate std;
+    use std::vec;
 
-    #[test]
-    fn test_in_memory_render_pass() {
-        let mut display: MockDisplay<Rgb565> = MockDisplay::new();
-        display.set_allow_overdraw(true);
-        display.set_allow_out_of_bounds_drawing(true);
+    struct StrictCanvas {
+        pixels: std::vec::Vec<Rgb565>,
+    }
 
-        let screen_bounds = Rectangle::new(Point::zero(), Size::new(800, 480));
-        let renderer = UiRenderer::new(screen_bounds);
-        let state: UiState<256> = UiState::new();
+    impl StrictCanvas {
+        fn new() -> Self {
+            Self {
+                pixels: vec![Rgb565::new(0, 0, 0); 800 * 480],
+            }
+        }
+    }
 
-        let result = renderer.render(&mut display, &state);
-        assert!(result.is_ok());
+    impl embedded_graphics::geometry::OriginDimensions for StrictCanvas {
+        fn size(&self) -> Size {
+            Size::new(800, 480)
+        }
+    }
+
+    impl DrawTarget for StrictCanvas {
+        type Color = Rgb565;
+        type Error = Point;
+
+        fn draw_iter<I>(&mut self, pixels: I) -> Result<(), Self::Error>
+        where
+            I: IntoIterator<Item = Pixel<Self::Color>>,
+        {
+            for Pixel(coord, color) in pixels.into_iter() {
+                if coord.x < 0 || coord.x >= 800 || coord.y < 0 || coord.y >= 480 {
+                    return Err(coord);
+                }
+                let idx = (coord.y as usize) * 800 + (coord.x as usize);
+                self.pixels[idx] = color;
+            }
+            Ok(())
+        }
+    }
+
+    struct PixelCanvas {
+        pixels: std::vec::Vec<Rgb565>,
+    }
+
+    impl PixelCanvas {
+        fn new() -> Self {
+            Self {
+                pixels: vec![Rgb565::new(0, 0, 0); 800 * 480],
+            }
+        }
+    }
+
+    impl embedded_graphics::geometry::OriginDimensions for PixelCanvas {
+        fn size(&self) -> Size {
+            Size::new(800, 480)
+        }
+    }
+
+    impl DrawTarget for PixelCanvas {
+        type Color = Rgb565;
+        type Error = core::convert::Infallible;
+
+        fn draw_iter<I>(&mut self, pixels: I) -> Result<(), Self::Error>
+        where
+            I: IntoIterator<Item = Pixel<Self::Color>>,
+        {
+            for Pixel(coord, color) in pixels.into_iter() {
+                if coord.x >= 0 && coord.x < 800 && coord.y >= 0 && coord.y < 480 {
+                    let idx = (coord.y as usize) * 800 + (coord.x as usize);
+                    self.pixels[idx] = color;
+                }
+            }
+            Ok(())
+        }
+    }
+
+    fn region_equals(
+        c1: &PixelCanvas,
+        c2: &PixelCanvas,
+        x_range: core::ops::Range<i32>,
+        y_range: core::ops::Range<i32>,
+    ) -> bool {
+        for y in y_range {
+            for x in x_range.clone() {
+                if c1.pixels[(y as usize) * 800 + (x as usize)]
+                    != c2.pixels[(y as usize) * 800 + (x as usize)]
+                {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     #[test]
-    fn test_render_all_operator_states_and_debug_screen() {
-        let mut display: MockDisplay<Rgb565> = MockDisplay::new();
-        display.set_allow_overdraw(true);
-        display.set_allow_out_of_bounds_drawing(true);
-
+    fn test_render_never_draws_out_of_bounds_across_all_screens_and_states() {
         let screen_bounds = Rectangle::new(Point::zero(), Size::new(800, 480));
         let core_screen_bounds = eg_rect_to_core(screen_bounds);
         let renderer = UiRenderer::new(screen_bounds);
-        let mut state: UiState<256> = UiState::new();
 
-        // 1. Screen::Operator in SessionState::Idle
+        // 1. Screen::Operator - Idle
+        let mut canvas = StrictCanvas::new();
+        let mut state: UiState<256> = UiState::new();
         assert_eq!(state.current_screen, Screen::Operator);
         assert_eq!(state.session.state(), &SessionState::Idle);
-        assert!(renderer.render(&mut display, &state).is_ok());
+        assert!(renderer.render(&mut canvas, &state).is_ok());
 
-        // 2. Screen::Operator in SessionState::Authenticated
-        let op = heapless::String::try_from("OP-42").unwrap();
+        // 2. Screen::Operator - Authenticated
+        let op = heapless::String::try_from("OP_42").unwrap();
         state.handle_event(
             trillby_core::UiEvent::RfidScanned(op),
             core_screen_bounds,
@@ -540,25 +617,149 @@ mod tests {
             state.session.state(),
             SessionState::Authenticated { .. }
         ));
-        assert!(renderer.render(&mut display, &state).is_ok());
+        assert!(renderer.render(&mut canvas, &state).is_ok());
 
-        // 3. Screen::Operator in SessionState::Working
-        let job = heapless::String::try_from("JOB-9000").unwrap();
+        // 3. Screen::Operator - Working with 64-char job_id and tick_count = 7_200_000
+        let mut long_job: heapless::String<64> = heapless::String::new();
+        for _ in 0..64 {
+            let _ = long_job.push('J');
+        }
         state.handle_event(
+            trillby_core::UiEvent::BarcodeScanned(long_job),
+            core_screen_bounds,
+            None,
+            None,
+        );
+        state.tick_count = 7_200_000;
+        assert!(matches!(state.session.state(), SessionState::Working { .. }));
+        assert!(renderer.render(&mut canvas, &state).is_ok());
+
+        // 4. Screen::Debug with keyboard_visible = true and false
+        state.current_screen = Screen::Debug;
+        state.keyboard_visible = true;
+        assert!(renderer.render(&mut canvas, &state).is_ok());
+
+        state.keyboard_visible = false;
+        assert!(renderer.render(&mut canvas, &state).is_ok());
+    }
+
+    #[test]
+    fn test_render_pixel_regions_change_on_state_keyboard_key_and_network_transitions() {
+        let screen_bounds = Rectangle::new(Point::zero(), Size::new(800, 480));
+        let core_screen_bounds = eg_rect_to_core(screen_bounds);
+        let renderer = UiRenderer::new(screen_bounds);
+
+        // 1. Content card region (x: 20..500, y: 100..260) between Idle, Authenticated, and Working
+        let state_idle: UiState<256> = UiState::new();
+        let mut canvas_idle = PixelCanvas::new();
+        renderer.render(&mut canvas_idle, &state_idle).unwrap();
+
+        let mut state_auth: UiState<256> = UiState::new();
+        let op = heapless::String::try_from("OP_42").unwrap();
+        state_auth.handle_event(
+            trillby_core::UiEvent::RfidScanned(op),
+            core_screen_bounds,
+            None,
+            None,
+        );
+        let mut canvas_auth = PixelCanvas::new();
+        renderer.render(&mut canvas_auth, &state_auth).unwrap();
+
+        let mut state_working: UiState<256> = UiState::new();
+        state_working.handle_event(
+            trillby_core::UiEvent::RfidScanned(heapless::String::try_from("OP_1").unwrap()),
+            core_screen_bounds,
+            None,
+            None,
+        );
+        let job = heapless::String::try_from("JOB_1").unwrap();
+        state_working.handle_event(
             trillby_core::UiEvent::BarcodeScanned(job),
             core_screen_bounds,
             None,
             None,
         );
-        state.tick_count = 1500;
-        assert!(matches!(state.session.state(), SessionState::Working { .. }));
-        assert!(renderer.render(&mut display, &state).is_ok());
+        let mut canvas_working = PixelCanvas::new();
+        renderer.render(&mut canvas_working, &state_working).unwrap();
 
-        // 4. Screen::Debug in Working state and Idle state
-        state.current_screen = Screen::Debug;
-        assert!(renderer.render(&mut display, &state).is_ok());
+        let card_x = 20..500;
+        let card_y = 100..260;
+        assert!(!region_equals(&canvas_idle, &canvas_auth, card_x.clone(), card_y.clone()));
+        assert!(!region_equals(&canvas_auth, &canvas_working, card_x.clone(), card_y.clone()));
+        assert!(!region_equals(&canvas_idle, &canvas_working, card_x, card_y));
 
-        state.keyboard_visible = false;
-        assert!(renderer.render(&mut display, &state).is_ok());
+        // 2. Keyboard region (x: 0..800, y: 300..480) between keyboard_visible = false and true
+        let mut state_kb_hidden: UiState<256> = UiState::new();
+        state_kb_hidden.keyboard_visible = false;
+        let mut canvas_kb_hidden = PixelCanvas::new();
+        renderer.render(&mut canvas_kb_hidden, &state_kb_hidden).unwrap();
+
+        let mut state_kb_visible: UiState<256> = UiState::new();
+        state_kb_visible.keyboard_visible = true;
+        let mut canvas_kb_visible = PixelCanvas::new();
+        renderer.render(&mut canvas_kb_visible, &state_kb_visible).unwrap();
+
+        assert!(!region_equals(&canvas_kb_hidden, &canvas_kb_visible, 0..800, 300..480));
+
+        let mut has_surface = false;
+        let mut has_border = false;
+        for y in 300..480 {
+            for x in 0..800 {
+                let p = canvas_kb_visible.pixels[y * 800 + x];
+                if p == renderer.theme.surface() {
+                    has_surface = true;
+                }
+                if p == renderer.theme.border() {
+                    has_border = true;
+                }
+            }
+        }
+        assert!(has_surface);
+        assert!(has_border);
+
+        // 3. Key 'Q' interior region when active_touch_key = Some(Key::Char('Q')) vs None
+        let mut state_unpressed: UiState<256> = UiState::new();
+        state_unpressed.keyboard_visible = true;
+        state_unpressed.active_touch_key = None;
+        let mut canvas_unpressed = PixelCanvas::new();
+        renderer.render(&mut canvas_unpressed, &state_unpressed).unwrap();
+
+        let mut state_pressed: UiState<256> = UiState::new();
+        state_pressed.keyboard_visible = true;
+        state_pressed.active_touch_key = Some(Key::Char('Q'));
+        let mut canvas_pressed = PixelCanvas::new();
+        renderer.render(&mut canvas_pressed, &state_pressed).unwrap();
+
+        assert!(!region_equals(&canvas_unpressed, &canvas_pressed, 0..80, 300..345));
+        assert_eq!(canvas_unpressed.pixels[302 * 800 + 20], renderer.theme.border());
+        assert_eq!(canvas_pressed.pixels[302 * 800 + 20], renderer.theme.primary());
+
+        // 4. Header network status badge region (x: 180..360, y: 6..30)
+        let mut state_offline: UiState<256> = UiState::new();
+        state_offline.network_status = trillby_core::net_types::NetworkStatus::Offline;
+        let mut canvas_offline = PixelCanvas::new();
+        renderer.render(&mut canvas_offline, &state_offline).unwrap();
+
+        let mut state_online: UiState<256> = UiState::new();
+        state_online.network_status = trillby_core::net_types::NetworkStatus::Online;
+        let mut canvas_online = PixelCanvas::new();
+        renderer.render(&mut canvas_online, &state_online).unwrap();
+
+        assert!(!region_equals(&canvas_offline, &canvas_online, 180..360, 6..30));
+
+        let mut offline_has_warning = false;
+        let mut online_has_success = false;
+        for y in 6..30 {
+            for x in 180..360 {
+                if canvas_offline.pixels[y * 800 + x] == renderer.theme.warning() {
+                    offline_has_warning = true;
+                }
+                if canvas_online.pixels[y * 800 + x] == renderer.theme.success() {
+                    online_has_success = true;
+                }
+            }
+        }
+        assert!(offline_has_warning);
+        assert!(online_has_success);
     }
 }

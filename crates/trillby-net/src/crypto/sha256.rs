@@ -208,4 +208,29 @@ mod tests {
             hex::<32>("cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0")
         );
     }
+
+    #[test]
+    fn test_sha256_55_and_64_byte_block_boundaries() {
+        // 55-byte input: 55 data bytes + 1 byte delimiter 0x80 + 8 bytes length = 64 bytes (exact single block)
+        let input_55 = [b'A'; 55];
+        let expected_55 = hex::<32>("8963cc0afd622cc7574ac2011f93a3059b3d65548a77542a1559e3d202e6ab00");
+        assert_eq!(sha256(&input_55), expected_55);
+
+        let mut streaming_55 = Sha256::new();
+        for &b in &input_55 {
+            streaming_55.update(&[b]);
+        }
+        assert_eq!(streaming_55.finalize(), expected_55);
+
+        // 64-byte input: exactly fills the first block, spilling padding into a second block
+        let input_64 = [b'A'; 64];
+        let expected_64 = hex::<32>("d53eda7a637c99cc7fb566d96e9fa109bf15c478410a3f5eb4d4c4e26cd081f6");
+        assert_eq!(sha256(&input_64), expected_64);
+
+        let mut streaming_64 = Sha256::new();
+        for &b in &input_64 {
+            streaming_64.update(&[b]);
+        }
+        assert_eq!(streaming_64.finalize(), expected_64);
+    }
 }

@@ -6,8 +6,9 @@
 
 use crate::packet::{
     decrypt_and_unpack, derive_session_key, pack_and_authenticate_hmac, pack_and_encrypt,
-    verify_and_unpack_hmac, AckPayload, AuthRespPayload, FrameHeader, HandshakeInitPayload,
-    HandshakeRespPayload, MsgType, PacketError, HEADER_LEN, HMAC_TAG_LEN, MAX_FRAME_LEN, TAG_LEN,
+    verify_and_unpack_hmac, AckPayload, AuthRespPayload, Direction, FrameHeader,
+    HandshakeInitPayload, HandshakeRespPayload, MsgType, PacketError, HEADER_LEN, HMAC_TAG_LEN,
+    MAX_FRAME_LEN, TAG_LEN,
 };
 use crate::posix::PosixSocket;
 
@@ -542,6 +543,9 @@ impl<const MAX_CLIENTS: usize> NetServer<MAX_CLIENTS> {
                 Ok(h) => h,
                 Err(_) => return Err(()),
             };
+            if hdr.direction() != Direction::ClientToServer {
+                return Err(());
+            }
 
             let frame_total_len = HEADER_LEN + (hdr.payload_len as usize);
             if frame_total_len > MAX_FRAME_LEN || (hdr.payload_len as usize) < TAG_LEN {
@@ -632,6 +636,7 @@ mod tests {
     use super::*;
     use crate::client::{ClientState, NetClient};
     use trillby_core::net_types::NetworkStatus;
+    use crate::packet::pack_and_encrypt_directed;
 
     fn step_client_poll<const CAP: usize, F>(
         client: &mut NetClient<CAP>,
@@ -856,6 +861,278 @@ mod tests {
         }
         assert_eq!(client3.status(), NetworkStatus::Online);
         assert_eq!(server.active_client_count(), 2);
+    }
+
+    fn read_exact_frame(stream: &mut std::net::TcpStream, buf: &mut [u8; MAX_FRAME_LEN]) -> usize {
+        use std::io::Read;
+        stream.set_nonblocking(false).unwrap();
+        stream.read_exact(&mut buf[..HEADER_LEN]).expect("read frame header");
+        let hdr = FrameHeader::decode(&buf[..HEADER_LEN]).expect("decode frame header");
+        let total_len = HEADER_LEN + (hdr.payload_len as usize);
+        assert!(total_len <= MAX_FRAME_LEN, "Frame exceeds MAX_FRAME_LEN");
+        stream.read_exact(&mut buf[HEADER_LEN..total_len]).expect("read frame payload");
+        stream.set_nonblocking(true).unwrap();
+        total_len
+    }
+
+    #[test]
+    fn test_server_rejects_malformed_handshakes_and_enforces_anti_replay() {
+        use std::io::Write;
+        let psk = [0x55u8; 32];
+        let uuid = [0xAAu8; 16];
+        let resolver = |id: &[u8; 16]| if *id == uuid { Some(psk) } else { None };
+        let mut now_ms = 1000u64;
+
+        let mut server = NetServer::<4>::bind([127, 0, 0, 1], 0).unwrap();
+        let port = server.port();
+
+        // (a) Bad magic
+        let mut s_bad_magic = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        now_ms += 10;
+        server.step(now_ms, resolver, |_| {});
+        assert_eq!(server.active_client_count(), 1);
+        s_bad_magic.write_all(&[0x00, 0x00, 0x01, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0, 0]).unwrap();
+        now_ms += 10;
+        server.step(now_ms, resolver, |_| {});
+        assert_eq!(server.active_client_count(), 0);
+
+        // (b) MsgType::Data before handshake completes
+        let mut s_bad_type = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        now_ms += 10;
+        server.step(now_ms, resolver, |_| {});
+        assert_eq!(server.active_client_count(), 1);
+        let hdr_data = FrameHeader::new(MsgType::Data, 0, 0, 32);
+        let mut hdr_bytes = [0u8; HEADER_LEN];
+        hdr_data.encode(&mut hdr_bytes);
+        s_bad_type.write_all(&hdr_bytes).unwrap();
+        now_ms += 10;
+        server.step(now_ms, resolver, |_| {});
+        assert_eq!(server.active_client_count(), 0);
+
+        // (c) HandshakeInit with bad HMAC tag
+        let mut s_bad_tag = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        now_ms += 10;
+        server.step(now_ms, resolver, |_| {});
+        assert_eq!(server.active_client_count(), 1);
+
+        let init_payload = HandshakeInitPayload {
+            client_nonce: [0x11; 32],
+            device_uuid: uuid,
+        };
+        let mut init_pt = [0u8; HandshakeInitPayload::LEN];
+        init_payload.encode(&mut init_pt).unwrap();
+        let mut init_frame = [0u8; MAX_FRAME_LEN];
+        let init_len = pack_and_authenticate_hmac(&psk, MsgType::HandshakeInit, 0, 0, &init_pt, &mut init_frame).unwrap();
+        init_frame[init_len - 1] ^= 0x01; // Corrupt tag
+        s_bad_tag.write_all(&init_frame[..init_len]).unwrap();
+        now_ms += 10;
+        server.step(now_ms, resolver, |_| {});
+        assert_eq!(server.active_client_count(), 0);
+
+        // Anti-replay test on valid connection
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        now_ms += 10;
+        server.step(now_ms, resolver, |_| {});
+        assert_eq!(server.active_client_count(), 1);
+
+        // Valid HandshakeInit
+        let valid_init = HandshakeInitPayload {
+            client_nonce: [0x22; 32],
+            device_uuid: uuid,
+        };
+        let mut valid_init_pt = [0u8; HandshakeInitPayload::LEN];
+        valid_init.encode(&mut valid_init_pt).unwrap();
+        let valid_init_len = pack_and_authenticate_hmac(&psk, MsgType::HandshakeInit, 0, 0, &valid_init_pt, &mut init_frame).unwrap();
+        stream.write_all(&init_frame[..valid_init_len]).unwrap();
+
+        now_ms += 10;
+        let mut connected = false;
+        server.step(now_ms, resolver, |ev| {
+            if let ServerEvent::Connected { .. } = ev {
+                connected = true;
+            }
+        });
+        assert!(connected);
+        assert!(server.is_client_online(0));
+
+        // Read HandshakeResp from server
+        let mut resp_buf = [0u8; MAX_FRAME_LEN];
+        let n = read_exact_frame(&mut stream, &mut resp_buf);
+        let (_hdr, resp_pt) = verify_and_unpack_hmac(&psk, &resp_buf[..n]).unwrap();
+        let resp_payload = HandshakeRespPayload::decode(resp_pt).unwrap();
+        let session_key = derive_session_key(
+            &psk,
+            &resp_payload.session_salt,
+            &valid_init.client_nonce,
+            &resp_payload.server_nonce,
+        );
+
+        // Send seq = 1 frame
+        let mut frame1 = [0u8; MAX_FRAME_LEN];
+        let len1 = pack_and_encrypt_directed(
+            &session_key,
+            &resp_payload.session_salt,
+            Direction::ClientToServer,
+            MsgType::Data,
+            resp_payload.assigned_session_id,
+            1,
+            b"PAYLOAD_1",
+            &mut frame1,
+        ).unwrap();
+        stream.write_all(&frame1[..len1]).unwrap();
+
+        let mut received_events: std::vec::Vec<(MsgType, std::vec::Vec<u8>)> = std::vec::Vec::new();
+        now_ms += 10;
+        server.step(now_ms, resolver, |ev| {
+            if let ServerEvent::Data { msg_type, payload, .. } = ev {
+                received_events.push((msg_type, payload.to_vec()));
+            }
+        });
+        assert_eq!(received_events.len(), 1);
+        assert_eq!(received_events[0].1, b"PAYLOAD_1");
+        let mut ack_buf = [0u8; MAX_FRAME_LEN];
+        let _ = read_exact_frame(&mut stream, &mut ack_buf);
+
+        // Replay exact seq = 1 frame
+        stream.write_all(&frame1[..len1]).unwrap();
+        let sfd = server.sessions[0].as_ref().unwrap().socket.fd();
+        let mut pfd = libc::pollfd { fd: sfd, events: libc::POLLIN, revents: 0 };
+        unsafe { libc::poll(&mut pfd, 1, 100) };
+        for _ in 0..10 {
+            now_ms += 10;
+            server.step(now_ms, resolver, |_| {});
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        // Replayed seq = 1 must be ignored
+        assert_eq!(received_events.len(), 1);
+        assert!(server.is_client_online(0));
+
+        // Send seq = 2 frame
+        let mut frame2 = [0u8; MAX_FRAME_LEN];
+        let len2 = pack_and_encrypt_directed(
+            &session_key,
+            &resp_payload.session_salt,
+            Direction::ClientToServer,
+            MsgType::Data,
+            resp_payload.assigned_session_id,
+            2,
+            b"PAYLOAD_2",
+            &mut frame2,
+        ).unwrap();
+        stream.write_all(&frame2[..len2]).unwrap();
+        let sfd = server.sessions[0].as_ref().unwrap().socket.fd();
+        let mut pfd = libc::pollfd { fd: sfd, events: libc::POLLIN, revents: 0 };
+        unsafe { libc::poll(&mut pfd, 1, 100) };
+        for _ in 0..10 {
+            now_ms += 10;
+            server.step(now_ms, resolver, |ev| {
+                if let ServerEvent::Data { msg_type, payload, .. } = ev {
+                    received_events.push((msg_type, payload.to_vec()));
+                }
+            });
+            if received_events.len() >= 2 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(received_events.len(), 2);
+        assert_eq!(received_events[1].1, b"PAYLOAD_2");
+    }
+
+    #[test]
+    fn test_server_byte_by_byte_fragmented_handshake_and_data() {
+        use std::io::Write;
+        let psk = [0x77u8; 32];
+        let uuid = [0x99u8; 16];
+        let resolver = |id: &[u8; 16]| if *id == uuid { Some(psk) } else { None };
+        let mut now_ms = 1000u64;
+
+        let mut server = NetServer::<4>::bind([127, 0, 0, 1], 0).unwrap();
+        let port = server.port();
+
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        now_ms += 10;
+        server.step(now_ms, resolver, |_| {});
+        assert_eq!(server.active_client_count(), 1);
+
+        // Prepare HandshakeInit frame
+        let client_nonce = [0x33u8; 32];
+        let init_payload = HandshakeInitPayload { client_nonce, device_uuid: uuid };
+        let mut init_pt = [0u8; HandshakeInitPayload::LEN];
+        init_payload.encode(&mut init_pt).unwrap();
+        let mut init_frame = [0u8; MAX_FRAME_LEN];
+        let init_len = pack_and_authenticate_hmac(&psk, MsgType::HandshakeInit, 0, 0, &init_pt, &mut init_frame).unwrap();
+
+        // Stream HandshakeInit 3 bytes at a time
+        let mut connected_fired = false;
+        for chunk in init_frame[..init_len].chunks(3) {
+            stream.write_all(chunk).unwrap();
+            now_ms += 1;
+            server.step(now_ms, resolver, |ev| {
+                if let ServerEvent::Connected { .. } = ev {
+                    connected_fired = true;
+                }
+            });
+        }
+        assert!(connected_fired);
+        assert!(server.is_client_online(0));
+
+        // Read HandshakeResp from server
+        let mut resp_buf = [0u8; MAX_FRAME_LEN];
+        let n = read_exact_frame(&mut stream, &mut resp_buf);
+        let (_hdr, resp_pt) = verify_and_unpack_hmac(&psk, &resp_buf[..n]).unwrap();
+        let resp_payload = HandshakeRespPayload::decode(resp_pt).unwrap();
+        let session_key = derive_session_key(
+            &psk,
+            &resp_payload.session_salt,
+            &client_nonce,
+            &resp_payload.server_nonce,
+        );
+
+        // Prepare encrypted Heartbeat frame
+        let hb = crate::packet::HeartbeatPayload {
+            battery_pct: 88,
+            rssi: -50,
+            pending_outbox: 0,
+            uptime_s: 120,
+        };
+        let mut hb_pt = [0u8; crate::packet::HeartbeatPayload::LEN];
+        hb.encode(&mut hb_pt).unwrap();
+        let mut hb_frame = [0u8; MAX_FRAME_LEN];
+        let hb_len = pack_and_encrypt_directed(
+            &session_key,
+            &resp_payload.session_salt,
+            Direction::ClientToServer,
+            MsgType::Heartbeat,
+            resp_payload.assigned_session_id,
+            1,
+            &hb_pt,
+            &mut hb_frame,
+        ).unwrap();
+
+        // Stream Heartbeat 3 bytes at a time
+        let mut hb_received = false;
+        for chunk in hb_frame[..hb_len].chunks(3) {
+            stream.write_all(chunk).unwrap();
+            for _ in 0..5 {
+                now_ms += 1;
+                server.step(now_ms, resolver, |ev| {
+                    if let ServerEvent::Data { msg_type, payload, .. } = ev {
+                        if msg_type == MsgType::Heartbeat {
+                            let decoded_hb = crate::packet::HeartbeatPayload::decode(payload).unwrap();
+                            assert_eq!(decoded_hb.battery_pct, 88);
+                            assert_eq!(decoded_hb.uptime_s, 120);
+                            hb_received = true;
+                        }
+                    }
+                });
+                if hb_received {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+        assert!(hb_received);
     }
 }
 

@@ -46,7 +46,7 @@ impl<'a> Badge<'a> {
             BadgeVariant::Success => (theme.success(), theme.primary_text()),
             BadgeVariant::Warning => (theme.warning(), theme.primary_text()),
             BadgeVariant::Info => (theme.primary(), theme.primary_text()),
-            BadgeVariant::Danger => (theme.warning(), theme.primary_text()),
+            BadgeVariant::Danger => (theme.danger(), theme.primary_text()),
         };
 
         let font = theme.font_small();

@@ -86,6 +86,19 @@ impl<const N: usize> Default for UiState<N> {
     }
 }
 
+/// `fmt::Write` adapter that appends whole chars until full, then stops
+/// formatting (heapless' own `write_str` drops an overflowing piece entirely).
+struct Truncating<'a, const CAP: usize>(&'a mut String<CAP>);
+
+impl<const CAP: usize> core::fmt::Write for Truncating<'_, CAP> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        for ch in s.chars() {
+            self.0.push(ch).map_err(|_| core::fmt::Error)?;
+        }
+        Ok(())
+    }
+}
+
 impl<const N: usize> UiState<N> {
     pub fn new() -> Self {
         Self::default()
@@ -98,22 +111,27 @@ impl<const N: usize> UiState<N> {
         self.session.pop_event()
     }
 
+    fn set_keyboard_visible(&mut self, visible: bool) {
+        self.keyboard_visible = visible;
+        if !visible {
+            self.active_touch_key = None;
+        }
+    }
 
     pub fn push_event_log(&mut self, msg: &str) {
+        use core::fmt::Write;
         self.last_event_desc.clear();
-        let _ = self.last_event_desc.push_str(msg);
+        let _ = Truncating(&mut self.last_event_desc).write_str(msg);
 
         // Shift history ring buffer
         for i in (1..6).rev() {
             self.event_history[i] = self.event_history[i - 1].clone();
         }
-        self.event_history[0].clear();
-        let _ = self.event_history[0].push_str(msg);
+        self.event_history[0] = self.last_event_desc.clone();
         if self.history_count < 6 {
             self.history_count += 1;
         }
     }
-
     /// Process an incoming UI event.
     pub fn handle_event(&mut self, event: UiEvent, _screen_bounds: Rect, kb_bounds: Option<Rect>, resolved_key: Option<Key>) {
         match event {
@@ -132,9 +150,8 @@ impl<const N: usize> UiState<N> {
 
                 use core::fmt::Write;
                 let mut log_buf: String<64> = String::new();
-                let _ = write!(log_buf, "TouchDown s:({}, {}) r:({}, {})", scaled.x, scaled.y, raw.0, raw.1);
+                let _ = write!(Truncating(&mut log_buf), "TouchDown s:({}, {}) r:({}, {})", scaled.x, scaled.y, raw.0, raw.1);
                 self.push_event_log(&log_buf);
-
                 if let Some(button) = HeaderButton::at(scaled) {
                     self.pressed_header = Some(button);
                     self.press_header(button);
@@ -163,17 +180,20 @@ impl<const N: usize> UiState<N> {
                         }
                     }
                 }
+                if self.pressed_debug.is_some_and(|b| !b.rect().contains(scaled)) {
+                    self.pressed_debug = None;
+                }
             }
             UiEvent::TouchUp { scaled, raw } => {
                 self.last_touch_raw = raw;
                 self.last_touch_scaled = Some(scaled);
                 self.pressed_header = None;
-                self.pressed_debug = None;
+                let armed_debug = self.pressed_debug.take();
                 self.dirty = true;
 
                 use core::fmt::Write;
                 let mut log_buf: String<64> = String::new();
-                let _ = write!(log_buf, "TouchUp s:({}, {})", scaled.x, scaled.y);
+                let _ = write!(Truncating(&mut log_buf), "TouchUp s:({}, {})", scaled.x, scaled.y);
                 self.push_event_log(&log_buf);
 
                 self.active_touch_key = None;
@@ -187,21 +207,21 @@ impl<const N: usize> UiState<N> {
                             self.last_key_pressed = Some(key);
 
                             let mut key_msg: String<64> = String::new();
-                            let _ = write!(key_msg, "Key Pressed: {:?}", key);
+                            let _ = write!(Truncating(&mut key_msg), "Key Pressed: {:?}", key);
                             self.push_event_log(&key_msg);
                         }
                     }
                 }
 
                 if !in_kb && self.current_screen == Screen::Debug {
-                    if let Some(dbg_btn) = DebugButton::at(scaled) {
+                    if let Some(dbg_btn) = DebugButton::at(scaled).filter(|b| Some(*b) == armed_debug) {
                         match dbg_btn {
                             DebugButton::AuthUser => {
                                 if self.session.force_authenticate(
                                     crate::session::DUMMY_OPERATOR_ID,
                                     self.tick_count,
                                 ) {
-                                    self.keyboard_visible = false;
+                                    self.set_keyboard_visible(false);
                                     self.input_buffer.clear();
                                     let _ = self
                                         .input_buffer
@@ -215,21 +235,21 @@ impl<const N: usize> UiState<N> {
                                     crate::session::DUMMY_JOB_ID,
                                     self.tick_count,
                                 ) {
-                                    self.keyboard_visible = true;
+                                    self.set_keyboard_visible(true);
                                     self.input_buffer.clear();
                                     self.push_event_log("Debug: Started Dummy Job");
                                 }
                             }
                             DebugButton::StopJob => {
                                 if self.session.force_stop_job(self.tick_count) {
-                                    self.keyboard_visible = false;
+                                    self.set_keyboard_visible(false);
                                     self.input_buffer.clear();
                                     self.push_event_log("Debug: Stopped Active Job");
                                 }
                             }
                             DebugButton::Logout => {
                                 if self.session.force_logout(self.tick_count) {
-                                    self.keyboard_visible = false;
+                                    self.set_keyboard_visible(false);
                                     self.input_buffer.clear();
                                     self.push_event_log("Debug: Operator Logged Out");
                                 }
@@ -241,7 +261,7 @@ impl<const N: usize> UiState<N> {
             UiEvent::RfidScanned(card_id) => {
                 self.rfid_count = self.rfid_count.saturating_add(1);
                 self.session.handle_rfid(&card_id, self.tick_count);
-                self.keyboard_visible = matches!(self.session.state(), SessionState::Working { .. });
+                self.set_keyboard_visible(matches!(self.session.state(), SessionState::Working { .. }));
                 self.input_buffer.clear();
                 if !matches!(self.session.state(), SessionState::Idle) {
                     let _ = self.input_buffer.push_str(&card_id);
@@ -250,7 +270,7 @@ impl<const N: usize> UiState<N> {
 
                 use core::fmt::Write;
                 let mut log_buf: String<64> = String::new();
-                let _ = write!(log_buf, "RFID Scanned: {}", card_id);
+                let _ = write!(Truncating(&mut log_buf), "RFID Scanned: {}", card_id);
                 self.push_event_log(&log_buf);
             }
             UiEvent::BarcodeScanned(code) => {
@@ -259,12 +279,13 @@ impl<const N: usize> UiState<N> {
 
                 match self.session.handle_barcode(&code, self.tick_count) {
                     Ok(()) => {
-                        self.keyboard_visible =
-                            matches!(self.session.state(), SessionState::Working { .. });
+                        self.set_keyboard_visible(
+                            matches!(self.session.state(), SessionState::Working { .. }),
+                        );
                         self.input_buffer.clear();
                         use core::fmt::Write;
                         let mut log_buf: String<64> = String::new();
-                        let _ = write!(log_buf, "Barcode Scanned: {}", code);
+                        let _ = write!(Truncating(&mut log_buf), "Barcode Scanned: {}", code);
                         self.push_event_log(&log_buf);
                     }
                     Err(SessionRejectReason::NotAuthenticated) => {
@@ -281,7 +302,7 @@ impl<const N: usize> UiState<N> {
                     self.dirty = true;
                     use core::fmt::Write;
                     let mut log_buf: String<64> = String::new();
-                    let _ = write!(log_buf, "Net Status: {:?}", status);
+                    let _ = write!(Truncating(&mut log_buf), "Net Status: {:?}", status);
                     self.push_event_log(&log_buf);
                 }
             }
@@ -301,7 +322,7 @@ impl<const N: usize> UiState<N> {
                 });
             }
             HeaderButton::Keyboard => {
-                self.keyboard_visible = !self.keyboard_visible;
+                self.set_keyboard_visible(!self.keyboard_visible);
                 self.push_event_log(if self.keyboard_visible {
                     "Keyboard: shown"
                 } else {
@@ -676,6 +697,337 @@ mod tests {
                 job_id: dummy_job,
                 started_at_tick: 0,
             })
+        );
+    }
+    #[test]
+    fn clear_header_button_resets_input_buffer_and_event_history() {
+        let mut s: UiState<64> = UiState::new();
+        let screen = Rect::new(Point::zero(), 800, 480);
+        let _ = s.input_buffer.push_str("ABC");
+        for i in 1..=6 {
+            let mut msg: String<64> = String::new();
+            use core::fmt::Write;
+            let _ = write!(msg, "Log message {}", i);
+            s.push_event_log(&msg);
+        }
+        assert_eq!(s.history_count, 6);
+        assert_eq!(s.input_buffer.as_str(), "ABC");
+
+        // Tap HeaderButton::Clear (Point::new(670, 10))
+        s.handle_event(
+            UiEvent::TouchDown {
+                scaled: Point::new(670, 10),
+                raw: (0, 0),
+            },
+            screen,
+            None,
+            None,
+        );
+
+        assert!(s.input_buffer.is_empty());
+        assert_eq!(s.history_count, 1);
+        assert_eq!(s.event_history[0].as_str(), "Cleared Buffer & Event Log");
+        for slot in &s.event_history[1..6] {
+            assert_eq!(slot.as_str(), "");
+        }
+    }
+
+    #[test]
+    fn tick_1hz_dirty_refresh_and_network_status_deduplication() {
+        let mut s: UiState<64> = UiState::new();
+        let screen = Rect::new(Point::zero(), 800, 480);
+
+        s.dirty = false;
+        for i in 1..=19 {
+            s.handle_event(UiEvent::Tick, screen, None, None);
+            assert_eq!(s.tick_count, i);
+            assert!(!s.dirty);
+        }
+
+        s.handle_event(UiEvent::Tick, screen, None, None);
+        assert_eq!(s.tick_count, 20);
+        assert_eq!(s.tick_count, crate::POLL_FREQ_HZ as u64);
+        assert!(s.dirty);
+
+        s.handle_event(
+            UiEvent::NetworkStatusChanged(NetworkStatus::Syncing(4)),
+            screen,
+            None,
+            None,
+        );
+        assert!(s.dirty);
+        assert_eq!(s.last_event_desc.as_str(), "Net Status: Syncing(4)");
+
+        s.dirty = false;
+        s.handle_event(
+            UiEvent::NetworkStatusChanged(NetworkStatus::Syncing(4)),
+            screen,
+            None,
+            None,
+        );
+        assert!(!s.dirty);
+
+        s.handle_event(
+            UiEvent::NetworkStatusChanged(NetworkStatus::Online),
+            screen,
+            None,
+            None,
+        );
+        assert!(s.dirty);
+    }
+
+    #[test]
+    fn keyboard_touch_move_switches_active_key_and_drag_out_cancels_keypress() {
+        let mut s: UiState<64> = UiState::new();
+        let screen = Rect::new(Point::zero(), 800, 480);
+        s.keyboard_visible = true;
+        let kb_bounds = Some(Rect::new(Point::new(0, 300), 800, 180));
+
+        s.handle_event(
+            UiEvent::TouchDown {
+                scaled: Point::new(40, 320),
+                raw: (0, 0),
+            },
+            screen,
+            kb_bounds,
+            Some(Key::Char('Q')),
+        );
+        assert_eq!(s.active_touch_key, Some(Key::Char('Q')));
+
+        s.handle_event(
+            UiEvent::TouchMove {
+                scaled: Point::new(120, 320),
+                raw: (0, 0),
+            },
+            screen,
+            kb_bounds,
+            Some(Key::Char('W')),
+        );
+        assert_eq!(s.active_touch_key, Some(Key::Char('W')));
+
+        s.handle_event(
+            UiEvent::TouchMove {
+                scaled: Point::new(120, 200),
+                raw: (0, 0),
+            },
+            screen,
+            kb_bounds,
+            None,
+        );
+        assert_eq!(s.active_touch_key, None);
+
+        s.handle_event(
+            UiEvent::TouchUp {
+                scaled: Point::new(120, 200),
+                raw: (0, 0),
+            },
+            screen,
+            kb_bounds,
+            None,
+        );
+        assert!(s.input_buffer.is_empty());
+        assert_eq!(s.key_count, 0);
+    }
+
+    #[test]
+    fn key_release_marks_state_dirty_even_after_frame_was_drawn() {
+        let mut s: UiState<64> = UiState::new();
+        let screen = Rect::new(Point::zero(), 800, 480);
+        s.keyboard_visible = true;
+        let kb_bounds = Some(Rect::new(Point::new(0, 300), 800, 180));
+        let q = Point::new(40, 320);
+
+        s.handle_event(UiEvent::TouchDown { scaled: q, raw: (0, 0) }, screen, kb_bounds, Some(Key::Char('Q')));
+        // Renderer consumed the TouchDown frame.
+        s.dirty = false;
+
+        s.handle_event(UiEvent::TouchUp { scaled: q, raw: (0, 0) }, screen, kb_bounds, Some(Key::Char('Q')));
+        assert_eq!(s.input_buffer.as_str(), "Q");
+        assert!(s.dirty, "typed key must trigger a repaint on release");
+    }
+
+    #[test]
+    fn scanner_event_hiding_keyboard_clears_active_touch_key() {
+        let mut s: UiState<64> = UiState::new();
+        let screen = Rect::new(Point::zero(), 800, 480);
+        let kb_bounds = Some(Rect::new(Point::new(0, 300), 800, 180));
+
+        // Enter Working state
+        let op: String<32> = String::try_from("OP_1").unwrap();
+        s.handle_event(UiEvent::RfidScanned(op), screen, kb_bounds, None);
+        let job: String<64> = String::try_from("JOB_1").unwrap();
+        s.handle_event(UiEvent::BarcodeScanned(job.clone()), screen, kb_bounds, None);
+        assert!(matches!(s.session_state(), SessionState::Working { .. }));
+        assert!(s.keyboard_visible);
+
+        // TouchDown on 'Q'
+        s.handle_event(
+            UiEvent::TouchDown {
+                scaled: Point::new(40, 320),
+                raw: (0, 0),
+            },
+            screen,
+            kb_bounds,
+            Some(Key::Char('Q')),
+        );
+        assert_eq!(s.active_touch_key, Some(Key::Char('Q')));
+
+        // Stop job via matching barcode -> hides keyboard
+        s.handle_event(UiEvent::BarcodeScanned(job), screen, kb_bounds, None);
+        assert!(!s.keyboard_visible);
+        assert_eq!(
+            s.active_touch_key, None,
+            "stopping job and hiding keyboard must clear stale active_touch_key"
+        );
+    }
+
+    #[test]
+    fn debug_button_requires_matching_touch_down_and_clears_on_drag_off() {
+        let mut s: UiState<64> = UiState::new();
+        let screen = Rect::new(Point::zero(), 800, 480);
+
+        // 1. On Screen::Operator, TouchDown on HeaderButton::Debug switches screen
+        assert_eq!(s.current_screen, Screen::Operator);
+        s.handle_event(
+            UiEvent::TouchDown {
+                scaled: Point::new(DEBUG_BUTTON.top_left.x + 5, 10),
+                raw: (0, 0),
+            },
+            screen,
+            None,
+            None,
+        );
+        assert_eq!(s.current_screen, Screen::Debug);
+
+        // TouchUp at DEBUG_AUTH_USER_BUTTON.top_left
+        s.handle_event(
+            UiEvent::TouchUp {
+                scaled: DEBUG_AUTH_USER_BUTTON.top_left,
+                raw: (0, 0),
+            },
+            screen,
+            None,
+            None,
+        );
+        assert_eq!(
+            s.session_state(),
+            &SessionState::Idle,
+            "must not trigger AuthUser without a matching TouchDown on AuthUser"
+        );
+
+        // 2. On Screen::Debug in SessionState::Idle:
+        // TouchDown on DEBUG_AUTH_USER_BUTTON
+        s.handle_event(
+            UiEvent::TouchDown {
+                scaled: DEBUG_AUTH_USER_BUTTON.top_left,
+                raw: (0, 0),
+            },
+            screen,
+            None,
+            None,
+        );
+        assert_eq!(s.pressed_debug, Some(DebugButton::AuthUser));
+
+        // TouchMove outside to (50, 100)
+        s.handle_event(
+            UiEvent::TouchMove {
+                scaled: Point::new(50, 100),
+                raw: (0, 0),
+            },
+            screen,
+            None,
+            None,
+        );
+        assert_eq!(
+            s.pressed_debug, None,
+            "dragging touch off debug button must clear pressed_debug"
+        );
+
+        // TouchUp on DEBUG_START_JOB_BUTTON
+        s.handle_event(
+            UiEvent::TouchUp {
+                scaled: DEBUG_START_JOB_BUTTON.top_left,
+                raw: (0, 0),
+            },
+            screen,
+            None,
+            None,
+        );
+        assert_eq!(
+            s.session_state(),
+            &SessionState::Idle,
+            "dragging touch across debug buttons must not trigger destination button"
+        );
+    }
+
+    #[test]
+    fn debug_buttons_noop_when_rejected_or_covered_by_keyboard() {
+        let mut s: UiState<64> = UiState::new();
+        let screen = Rect::new(Point::zero(), 800, 480);
+        s.current_screen = Screen::Debug;
+        let _ = s.input_buffer.push_str("KEEP");
+
+        tap(&mut s, DEBUG_STOP_JOB_BUTTON.top_left);
+        assert_eq!(s.input_buffer.as_str(), "KEEP");
+        assert_eq!(s.session_state(), &SessionState::Idle);
+
+        tap(&mut s, DEBUG_LOGOUT_BUTTON.top_left);
+        assert_eq!(s.input_buffer.as_str(), "KEEP");
+        assert_eq!(s.session_state(), &SessionState::Idle);
+
+        // Covering keyboard
+        s.keyboard_visible = true;
+        let kb_bounds = Some(Rect::new(Point::new(0, 180), 800, 300));
+        s.handle_event(
+            UiEvent::TouchDown {
+                scaled: DEBUG_AUTH_USER_BUTTON.top_left,
+                raw: (0, 0),
+            },
+            screen,
+            kb_bounds,
+            None,
+        );
+        s.handle_event(
+            UiEvent::TouchUp {
+                scaled: DEBUG_AUTH_USER_BUTTON.top_left,
+                raw: (0, 0),
+            },
+            screen,
+            kb_bounds,
+            None,
+        );
+        assert_eq!(
+            s.session_state(),
+            &SessionState::Idle,
+            "DebugButton::AuthUser must not fire when covered by keyboard"
+        );
+    }
+
+    #[test]
+    fn overlong_event_log_and_barcode_messages_truncate_to_64_bytes_instead_of_dropping() {
+        let mut s: UiState<64> = UiState::new();
+        let screen = Rect::new(Point::zero(), 800, 480);
+
+        // Authenticate operator
+        let op: String<32> = String::try_from("OP_99").unwrap();
+        s.handle_event(UiEvent::RfidScanned(op), screen, None, None);
+        assert!(matches!(s.session_state(), SessionState::Authenticated { .. }));
+
+        // 60-char barcode
+        let barcode_str = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        assert_eq!(barcode_str.len(), 60);
+        let barcode_60: String<64> = String::try_from(barcode_str).unwrap();
+
+        s.handle_event(UiEvent::BarcodeScanned(barcode_60), screen, None, None);
+
+        assert!(
+            !s.last_event_desc.is_empty(),
+            "overlong barcode log message was completely dropped instead of truncated"
+        );
+        assert!(
+            s.last_event_desc.as_str().starts_with("Barcode Scanned: BBB"),
+            "expected log message to start with 'Barcode Scanned: BBB', got: {:?}",
+            s.last_event_desc.as_str()
         );
     }
 }
