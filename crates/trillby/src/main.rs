@@ -11,6 +11,7 @@ extern crate libc;
 
 mod console;
 mod fb;
+mod hw;
 mod init;
 
 // ---------------------------------------------------------------------------
@@ -58,29 +59,16 @@ use embedded_graphics::{
 };
 use embedded_graphics_framebuf::FrameBuf;
 use fb::FramebufferWriter;
-use trillby_core::{
-    Point as CorePoint, SessionEvent, UiEvent, UiState, POLL_TIMEOUT_MS,
-};
-use trillby_ui::{
-    eg_rect_to_core, KeyboardGrid, LayoutZones, UiRenderer,
-};
+use trillby_core::{SessionEvent, UiEvent, UiState, POLL_TIMEOUT_MS};
+use trillby_ui::{eg_rect_to_core, LayoutZones, UiRenderer};
 
-#[repr(C)]
-#[derive(Debug, Copy, Clone, Default)]
-pub struct InputEvent {
-    pub time: libc::timeval,
-    pub type_: u16,
-    pub code: u16,
-    pub value: i32,
-}
-
-struct BufferWriter<'a> {
+pub(crate) struct BufferWriter<'a> {
     buf: &'a mut [u8],
-    offset: usize,
+    pub(crate) offset: usize,
 }
 
 impl<'a> BufferWriter<'a> {
-    fn new(buf: &'a mut [u8]) -> Self {
+    pub(crate) fn new(buf: &'a mut [u8]) -> Self {
         Self { buf, offset: 0 }
     }
 }
@@ -102,29 +90,6 @@ pub(crate) fn raw_print(msg: &str) {
     }
 }
 
-
-#[cfg(feature = "qemu-sim")]
-const QEMU_RAW_MAX_X: i64 = ((32767 * 340) / 800) * 2; // 27850
-#[cfg(feature = "qemu-sim")]
-const QEMU_RAW_MAX_Y: i64 = ((32767 * 222) / 480) * 2; // 30308
-
-fn scale_touch_point(raw_x: i32, raw_y: i32, max_x: i64, max_y: i64) -> Point {
-    #[cfg(feature = "qemu-sim")]
-    {
-        let mx = max_x.max(1);
-        let my = max_y.max(1);
-        let x = (raw_x.clamp(0, mx as i32) as i64 * 800 / mx) as i32;
-        let y = (raw_y.clamp(0, my as i32) as i64 * 480 / my) as i32;
-        Point::new(x.clamp(0, 799), y.clamp(0, 479))
-    }
-
-    #[cfg(not(feature = "qemu-sim"))]
-    {
-        let _ = (max_x, max_y);
-        // Physical touchscreens report direct 1:1 pixel coordinates (0..799, 0..479)
-        Point::new(raw_x.clamp(0, 799), raw_y.clamp(0, 479))
-    }
-}
 
 fn run_app() {
     init::setup_pid1();
@@ -160,7 +125,7 @@ fn run_app() {
                     0x54, 0x52, 0x49, 0x4C, 0x4C, 0x42, 0x59, 0x5F,
                     0x30, 0x30, 0x30, 0x31, 0x00, 0x00, 0x00, 0x00,
                 ],
-                server_ip: [127, 0, 0, 1],
+                server_ip: hw::default_server_ip(),
                 server_port: 8088,
             }
         });
@@ -172,65 +137,15 @@ fn run_app() {
         provisioning.server_port,
     );
 
-    #[cfg(feature = "qemu-sim")]
-    let tty_fd = unsafe {
-        libc::open(b"/dev/ttyAMA0\0".as_ptr() as *const _, libc::O_RDONLY | libc::O_NONBLOCK)
-    };
-    #[cfg(feature = "qemu-sim")]
-    if tty_fd >= 0 {
-        raw_print("Serial stdin listener enabled on /dev/ttyAMA0\n");
-        raw_print("  Commands: rfid <id> | barcode <code> | type <text> | click <x> <y> | scale <max_x> <max_y>\n");
-    }
-
-    // Open evdev devices (/dev/input/event0 .. event9)
-    let mut evdev_fds: [libc::c_int; 10] = [-1; 10];
-    let mut evdev_cnt = 0;
-
-    for i in 0..10 {
-        let mut path_buf = [0u8; 32];
-        use core::fmt::Write;
-        let mut w = BufferWriter::new(&mut path_buf);
-        let _ = write!(w, "/dev/input/event{}\0", i);
-
-        let fd = unsafe { libc::open(path_buf.as_ptr() as *const _, libc::O_RDONLY | libc::O_NONBLOCK) };
-        if fd >= 0 {
-            evdev_fds[evdev_cnt] = fd;
-            evdev_cnt += 1;
-        }
-    }
-
-    let mut raw_x: i32 = 0;
-    let mut raw_y: i32 = 0;
-    let mut is_touch_down = false;
-    let mut touch_moved = false;
+    let mut hw = hw::Hardware::new();
     let mut last_heartbeat_ms: u64 = 0;
 
-    #[cfg(feature = "qemu-sim")]
-    let mut touch_max_x: i64 = QEMU_RAW_MAX_X;
-    #[cfg(feature = "qemu-sim")]
-    let mut touch_max_y: i64 = QEMU_RAW_MAX_Y;
-    #[cfg(not(feature = "qemu-sim"))]
-    let (touch_max_x, touch_max_y): (i64, i64) = (799, 479);
-
-    #[cfg(feature = "qemu-sim")]
-    let mut serial_line_buf = [0u8; 128];
-    #[cfg(feature = "qemu-sim")]
-    let mut serial_line_len = 0;
     // Single-threaded zero-allocation POSIX poll loop with centralized timeout
     loop {
         let mut pollfds: [libc::pollfd; 16] = unsafe { core::mem::zeroed() };
         let mut poll_count = 0;
 
-        #[cfg(feature = "qemu-sim")]
-        if tty_fd >= 0 {
-            pollfds[poll_count] = libc::pollfd { fd: tty_fd, events: libc::POLLIN, revents: 0 };
-            poll_count += 1;
-        }
-
-        for i in 0..evdev_cnt {
-            pollfds[poll_count] = libc::pollfd { fd: evdev_fds[i], events: libc::POLLIN, revents: 0 };
-            poll_count += 1;
-        }
+        hw.register_poll(&mut pollfds, &mut poll_count);
 
         let net_fd = net_client.socket_fd();
         let mut net_poll_idx: i32 = -1;
@@ -259,158 +174,13 @@ fn run_app() {
             // 50ms Timeout -> send 20Hz Tick event
             state.handle_event(UiEvent::Tick, core_bounds, core_kb_bounds, None);
         } else if ret > 0 {
-            for i in 0..poll_count {
-                let pfd = pollfds[i];
-                if (pfd.revents & libc::POLLIN) != 0 {
-                    #[cfg(feature = "qemu-sim")]
-                    if tty_fd >= 0 && pfd.fd == tty_fd {
-                        let mut read_buf = [0u8; 64];
-                        let n = unsafe {
-                            libc::read(tty_fd, read_buf.as_mut_ptr() as *mut _, read_buf.len())
-                        };
-                        if n > 0 {
-                            for &b in &read_buf[..n as usize] {
-                                if b == b'\n' || b == b'\r' {
-                                    if serial_line_len > 0 {
-                                        if let Ok(line) = core::str::from_utf8(&serial_line_buf[..serial_line_len]) {
-                                            let trimmed = line.trim();
-                                            if let Some(rest) = trimmed.strip_prefix("rfid ") {
-                                                if let Ok(id) = heapless::String::try_from(rest) {
-                                                    state.handle_event(UiEvent::RfidScanned(id), core_bounds, core_kb_bounds, None);
-                                                }
-                                            } else if let Some(rest) = trimmed.strip_prefix("barcode ") {
-                                                if let Ok(data) = heapless::String::try_from(rest) {
-                                                    state.handle_event(UiEvent::BarcodeScanned(data), core_bounds, core_kb_bounds, None);
-                                                }
-                                            } else if let Some(rest) = trimmed.strip_prefix("type ") {
-                                                for c in rest.chars() {
-                                                    state.apply_key(trillby_core::Key::Char(c));
-                                                }
-                                                state.dirty = true;
-                                            } else if let Some(rest) = trimmed.strip_prefix("scale ") {
-                                                let mut parts = rest.split_whitespace();
-                                                if let (Some(mx_str), Some(my_str)) = (parts.next(), parts.next()) {
-                                                    if let (Ok(mx), Ok(my)) = (mx_str.parse::<i64>(), my_str.parse::<i64>()) {
-                                                        if mx > 0 && my > 0 {
-                                                            touch_max_x = mx;
-                                                            touch_max_y = my;
-                                                            let mut log_buf = [0u8; 96];
-                                                            use core::fmt::Write;
-                                                            let mut w = BufferWriter::new(&mut log_buf);
-                                                            let _ = write!(w, "[TOUCH] scale max updated -> ({}, {})\n", touch_max_x, touch_max_y);
-                                                            let len = w.offset;
-                                                            if let Ok(s) = core::str::from_utf8(&log_buf[..len]) {
-                                                                raw_print(s);
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            } else if let Some(rest) = trimmed.strip_prefix("click ") {
-                                                let mut parts = rest.split_whitespace();
-                                                if let (Some(x_str), Some(y_str)) = (parts.next(), parts.next()) {
-                                                    if let (Ok(x), Ok(y)) = (x_str.parse::<i32>(), y_str.parse::<i32>()) {
-                                                        let eg_pt = Point::new(x, y);
-                                                        let core_pt = CorePoint::new(x, y);
-                                                        let key = zones.keyboard_area.and_then(|kb| KeyboardGrid::resolve_key(kb, eg_pt, state.keyboard_layer));
-
-                                                        state.handle_event(UiEvent::TouchDown { scaled: core_pt, raw: (x, y) }, core_bounds, core_kb_bounds, key);
-                                                        state.handle_event(UiEvent::TouchUp { scaled: core_pt, raw: (x, y) }, core_bounds, core_kb_bounds, None);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        serial_line_len = 0;
-                                    }
-                                } else if serial_line_len < serial_line_buf.len() {
-                                    serial_line_buf[serial_line_len] = b;
-                                    serial_line_len += 1;
-                                }
-                            }
-                        }
-                        continue;
-                    }
-
-                    // Read evdev InputEvents
-                    loop {
-                        let mut events = [InputEvent::default(); 64];
-                        let n = unsafe {
-                            libc::read(
-                                pfd.fd,
-                                events.as_mut_ptr() as *mut _,
-                                events.len() * core::mem::size_of::<InputEvent>(),
-                            )
-                        };
-                        if n <= 0 {
-                            break;
-                        }
-                        let ev_count = n as usize / core::mem::size_of::<InputEvent>();
-                        for ev in &events[..ev_count] {
-                            match ev.type_ {
-                                3 => { // EV_ABS
-                                    if ev.code == 0 || ev.code == 53 {
-                                        raw_x = ev.value;
-                                        touch_moved = true;
-                                    } else if ev.code == 1 || ev.code == 54 {
-                                        raw_y = ev.value;
-                                        touch_moved = true;
-                                    }
-                                }
-                                2 => { // EV_REL
-                                    if ev.code == 0 {
-                                        raw_x = (raw_x + ev.value * 10).clamp(0, 32767);
-                                        touch_moved = true;
-                                    } else if ev.code == 1 {
-                                        raw_y = (raw_y + ev.value * 10).clamp(0, 32767);
-                                        touch_moved = true;
-                                    }
-                                }
-                                1 => { // EV_KEY
-                                    if ev.code == 330 || ev.code == 272 { // BTN_TOUCH or BTN_LEFT
-                                        let eg_pt = scale_touch_point(raw_x, raw_y, touch_max_x, touch_max_y);
-                                        let core_pt = CorePoint::new(eg_pt.x, eg_pt.y);
-                                        if ev.value == 1 {
-                                            is_touch_down = true;
-                                            touch_moved = false;
-                                            #[cfg(feature = "qemu-sim")]
-                                            {
-                                                let mut log_buf = [0u8; 128];
-                                                use core::fmt::Write;
-                                                let mut w = BufferWriter::new(&mut log_buf);
-                                                let _ = write!(
-                                                    w,
-                                                    "[TOUCH] raw=({}, {}) scaled=({}, {}) max=({}, {})\n",
-                                                    raw_x, raw_y, core_pt.x, core_pt.y, touch_max_x, touch_max_y
-                                                );
-                                                let len = w.offset;
-                                                if let Ok(s) = core::str::from_utf8(&log_buf[..len]) {
-                                                    raw_print(s);
-                                                }
-                                            }
-                                            let key = zones.keyboard_area.and_then(|kb| KeyboardGrid::resolve_key(kb, eg_pt, state.keyboard_layer));
-                                            state.handle_event(UiEvent::TouchDown { scaled: core_pt, raw: (raw_x, raw_y) }, core_bounds, core_kb_bounds, key);
-                                        } else if ev.value == 0 {
-                                            is_touch_down = false;
-                                            touch_moved = false;
-                                            let key = zones.keyboard_area.and_then(|kb| KeyboardGrid::resolve_key(kb, eg_pt, state.keyboard_layer));
-                                            state.handle_event(UiEvent::TouchUp { scaled: core_pt, raw: (raw_x, raw_y) }, core_bounds, core_kb_bounds, key);
-                                        }
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-            }
-
-            // After draining all queues, if we moved while down, dispatch one coalesced TouchMove
-            if is_touch_down && touch_moved {
-                let eg_pt = scale_touch_point(raw_x, raw_y, touch_max_x, touch_max_y);
-                let core_pt = CorePoint::new(eg_pt.x, eg_pt.y);
-                let key = zones.keyboard_area.and_then(|kb| KeyboardGrid::resolve_key(kb, eg_pt, state.keyboard_layer));
-                state.handle_event(UiEvent::TouchMove { scaled: core_pt, raw: (raw_x, raw_y) }, core_bounds, core_kb_bounds, key);
-                touch_moved = false;
-            }
+            hw.handle_poll(
+                &pollfds[..poll_count],
+                &mut state,
+                &zones,
+                core_bounds,
+                core_kb_bounds,
+            );
         }
 
         // Drain pending session events generated during UI event handling into network outbox
