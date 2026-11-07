@@ -10,6 +10,8 @@ cargo test --workspace
 
 echo "==> Running CLI Provisioning & Floor Server E2E Smoke Test..."
 TMP_DIR="$(mktemp -d)"
+SMOKE_HOST="127.0.0.1"
+SMOKE_PORT="18088"
 SERVER_PID=""
 cleanup() {
     if [ -n "$SERVER_PID" ] && kill -0 "$SERVER_PID" 2>/dev/null; then
@@ -23,15 +25,15 @@ trap cleanup EXIT
 ./scripts/provision_device.sh \
     --out "$TMP_DIR/device.key" \
     --registry "$TMP_DIR/registry.tsv" \
-    --server-ip 127.0.0.1 \
-    --server-port 18088
+    --server-ip "$SMOKE_HOST" \
+    --server-port "$SMOKE_PORT"
 
 ./scripts/provision_device.sh --dump "$TMP_DIR/device.key"
 
 SERVER_LOG="$TMP_DIR/server.log"
 cargo run -p trillby-server -- \
-    --bind 127.0.0.1 \
-    --port 18088 \
+    --bind "$SMOKE_HOST" \
+    --port "$SMOKE_PORT" \
     --registry "$TMP_DIR/registry.tsv" \
     --dev > "$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
@@ -49,7 +51,7 @@ if ! grep -q "LISTEN" "$SERVER_LOG"; then
     exit 1
 fi
 
-cargo run -p trillby-server --example fake_client -- 18088
+cargo run -p trillby-server --example fake_client -- "$SMOKE_PORT"
 
 for expected in "AUTH" "WORK_START" "WORK_STOP" "LOGOUT" "HEARTBEAT"; do
     if ! grep -q "$expected" "$SERVER_LOG"; then

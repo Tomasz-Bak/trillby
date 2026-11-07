@@ -12,10 +12,12 @@ use crate::crypto::{
 pub const FRAME_MAGIC: [u8; 2] = [0x54, 0x52]; // "TR"
 pub const PROTOCOL_VERSION: u8 = 0x01;
 pub const HEADER_LEN: usize = 16;
-pub const TAG_LEN: usize = 16;
-pub const HMAC_TAG_LEN: usize = 32;
+pub use crate::crypto::TAG_LEN;
+pub const HMAC_TAG_LEN: usize = crate::crypto::DIGEST_LEN;
 pub const MAX_PAYLOAD_LEN: u16 = 240;
 pub const MAX_FRAME_LEN: usize = HEADER_LEN + (MAX_PAYLOAD_LEN as usize); // 256 bytes
+pub const OPERATOR_ID_CAP: usize = trillby_core::MAX_OPERATOR_ID_LEN;
+pub const JOB_ID_CAP: usize = trillby_core::MAX_JOB_ID_LEN;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PacketError {
@@ -27,6 +29,9 @@ pub enum PacketError {
     DecryptionFailed,
     AuthenticationFailed,
     InvalidPayload,
+    SendFailed,
+    NotOnline,
+    EncryptionFailed,
 }
 
 #[repr(u8)]
@@ -34,6 +39,7 @@ pub enum PacketError {
 pub enum MsgType {
     HandshakeInit = 0x01,
     HandshakeResp = 0x02,
+    /// Reserved for future OTA rekeying; currently ignored by both peers.
     Rekey         = 0x03,
     Heartbeat     = 0x10,
     Ack           = 0x11,
@@ -80,6 +86,11 @@ impl<'a> ByteWriter<'a> {
     #[inline]
     pub fn offset(&self) -> usize {
         self.offset
+    }
+
+    #[inline]
+    pub fn written(&self) -> &[u8] {
+        &self.buf[..self.offset]
     }
 
     #[inline]
@@ -287,6 +298,17 @@ impl FrameHeader {
         }
     }
 
+    pub fn set_direction(&mut self, d: Direction) {
+        match d {
+            Direction::ClientToServer => self.flags |= FLAG_CLIENT_TO_SERVER,
+            Direction::ServerToClient => self.flags &= !FLAG_CLIENT_TO_SERVER,
+        }
+    }
+
+    pub fn is_direction(&self, d: Direction) -> bool {
+        self.direction() == d
+    }
+
     /// Derive standard 12-byte AEAD nonce: [salt ^ dir (4B) || session_id LE (4B) || seq_num LE (4B)], dir = 0x80 in byte 0 for client->server
     pub fn derive_nonce(&self, salt: &[u8; 4]) -> [u8; 12] {
         let mut nonce = [0u8; 12];
@@ -302,8 +324,14 @@ impl FrameHeader {
 }
 
 // ===========================================================================
-// Specific Payloads
+// Payloads
 // ===========================================================================
+
+pub trait Payload {
+    const MSG_TYPE: MsgType;
+    const LEN: usize;
+    fn encode(&self, out: &mut [u8]) -> Result<(), PacketError>;
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HandshakeInitPayload {
@@ -328,6 +356,15 @@ impl HandshakeInitPayload {
         Ok(Self { client_nonce, device_uuid })
     }
 }
+impl Payload for HandshakeInitPayload {
+    const MSG_TYPE: MsgType = MsgType::HandshakeInit;
+    const LEN: usize = Self::LEN;
+
+    fn encode(&self, out: &mut [u8]) -> Result<(), PacketError> {
+        Self::encode(self, out)
+    }
+}
+
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HandshakeRespPayload {
@@ -359,16 +396,41 @@ impl HandshakeRespPayload {
         })
     }
 }
+impl Payload for HandshakeRespPayload {
+    const MSG_TYPE: MsgType = MsgType::HandshakeResp;
+    const LEN: usize = Self::LEN;
+
+    fn encode(&self, out: &mut [u8]) -> Result<(), PacketError> {
+        Self::encode(self, out)
+    }
+}
+
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AuthInitPayload {
     pub auth_data_len: u8,
-    pub auth_data: [u8; 32],
+    pub auth_data: [u8; OPERATOR_ID_CAP],
     pub timestamp_ms: u64,
 }
 
+fn truncated<const N: usize>(src: &[u8]) -> (u8, [u8; N]) {
+    let len = src.len().min(N);
+    let mut buf = [0u8; N];
+    buf[..len].copy_from_slice(&src[..len]);
+    (len as u8, buf)
+}
+
 impl AuthInitPayload {
-    pub const LEN: usize = 41; // 1 + 32 + 8
+    pub const LEN: usize = 1 + OPERATOR_ID_CAP + 8;
+
+    pub fn new(auth_data: &[u8], timestamp_ms: u64) -> Self {
+        let (auth_data_len, auth_data) = truncated(auth_data);
+        Self {
+            auth_data_len,
+            auth_data,
+            timestamp_ms,
+        }
+    }
 
     pub fn encode(&self, out: &mut [u8]) -> Result<(), PacketError> {
         let mut w = ByteWriter::new(out);
@@ -381,10 +443,10 @@ impl AuthInitPayload {
     pub fn decode(bytes: &[u8]) -> Result<Self, PacketError> {
         let mut r = ByteReader::new(bytes);
         let auth_data_len = r.read_u8()?;
-        if auth_data_len > 32 {
+        if (auth_data_len as usize) > OPERATOR_ID_CAP {
             return Err(PacketError::InvalidPayload);
         }
-        let auth_data = r.read_array::<32>()?;
+        let auth_data = r.read_array::<OPERATOR_ID_CAP>()?;
         let timestamp_ms = r.read_u64_le()?;
         Ok(Self {
             auth_data_len,
@@ -392,7 +454,22 @@ impl AuthInitPayload {
             timestamp_ms,
         })
     }
+
+    #[inline]
+    pub fn auth_data_bytes(&self) -> &[u8] {
+        let len = (self.auth_data_len as usize).min(self.auth_data.len());
+        &self.auth_data[..len]
+    }
 }
+impl Payload for AuthInitPayload {
+    const MSG_TYPE: MsgType = MsgType::AuthInit;
+    const LEN: usize = Self::LEN;
+
+    fn encode(&self, out: &mut [u8]) -> Result<(), PacketError> {
+        Self::encode(self, out)
+    }
+}
+
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AuthRespPayload {
@@ -424,6 +501,15 @@ impl AuthRespPayload {
         })
     }
 }
+impl Payload for AuthRespPayload {
+    const MSG_TYPE: MsgType = MsgType::AuthResp;
+    const LEN: usize = Self::LEN;
+
+    fn encode(&self, out: &mut [u8]) -> Result<(), PacketError> {
+        Self::encode(self, out)
+    }
+}
+
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HeartbeatPayload {
@@ -459,6 +545,15 @@ impl HeartbeatPayload {
         })
     }
 }
+impl Payload for HeartbeatPayload {
+    const MSG_TYPE: MsgType = MsgType::Heartbeat;
+    const LEN: usize = Self::LEN;
+
+    fn encode(&self, out: &mut [u8]) -> Result<(), PacketError> {
+        Self::encode(self, out)
+    }
+}
+
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AckPayload {
@@ -468,6 +563,7 @@ pub struct AckPayload {
 
 impl AckPayload {
     pub const LEN: usize = 5;
+    pub const STATUS_OK: u8 = 0;
 
     pub fn encode(&self, out: &mut [u8]) -> Result<(), PacketError> {
         let mut w = ByteWriter::new(out);
@@ -483,6 +579,15 @@ impl AckPayload {
         Ok(Self { acked_seq, status })
     }
 }
+impl Payload for AckPayload {
+    const MSG_TYPE: MsgType = MsgType::Ack;
+    const LEN: usize = Self::LEN;
+
+    fn encode(&self, out: &mut [u8]) -> Result<(), PacketError> {
+        Self::encode(self, out)
+    }
+}
+
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -509,67 +614,52 @@ impl TryFrom<u8> for WorkEventKind {
 pub struct WorkEventPayload {
     pub kind: WorkEventKind,
     pub operator_id_len: u8,
-    pub operator_id: [u8; 32],
+    pub operator_id: [u8; OPERATOR_ID_CAP],
     pub job_id_len: u8,
-    pub job_id: [u8; 64],
+    pub job_id: [u8; JOB_ID_CAP],
     pub timestamp_ms: u64,
     pub duration_ms: u64,
 }
 
 impl WorkEventPayload {
-    pub const LEN: usize = 115; // 1 + 1 + 32 + 1 + 64 + 8 + 8
+    pub const LEN: usize = 1 + 1 + OPERATOR_ID_CAP + 1 + JOB_ID_CAP + 8 + 8;
 
     pub fn work_start(operator_id: &[u8], job_id: &[u8], timestamp_ms: u64) -> Self {
-        let op_len = operator_id.len().min(32);
-        let mut op_buf = [0u8; 32];
-        op_buf[..op_len].copy_from_slice(&operator_id[..op_len]);
-
-        let job_len = job_id.len().min(64);
-        let mut job_buf = [0u8; 64];
-        job_buf[..job_len].copy_from_slice(&job_id[..job_len]);
-
+        let (operator_id_len, operator_id) = truncated(operator_id);
+        let (job_id_len, job_id) = truncated(job_id);
         Self {
             kind: WorkEventKind::WorkStart,
-            operator_id_len: op_len as u8,
-            operator_id: op_buf,
-            job_id_len: job_len as u8,
-            job_id: job_buf,
+            operator_id_len,
+            operator_id,
+            job_id_len,
+            job_id,
             timestamp_ms,
             duration_ms: 0,
         }
     }
 
     pub fn work_stop(operator_id: &[u8], job_id: &[u8], timestamp_ms: u64, duration_ms: u64) -> Self {
-        let op_len = operator_id.len().min(32);
-        let mut op_buf = [0u8; 32];
-        op_buf[..op_len].copy_from_slice(&operator_id[..op_len]);
-
-        let job_len = job_id.len().min(64);
-        let mut job_buf = [0u8; 64];
-        job_buf[..job_len].copy_from_slice(&job_id[..job_len]);
-
+        let (operator_id_len, operator_id) = truncated(operator_id);
+        let (job_id_len, job_id) = truncated(job_id);
         Self {
             kind: WorkEventKind::WorkStop,
-            operator_id_len: op_len as u8,
-            operator_id: op_buf,
-            job_id_len: job_len as u8,
-            job_id: job_buf,
+            operator_id_len,
+            operator_id,
+            job_id_len,
+            job_id,
             timestamp_ms,
             duration_ms,
         }
     }
 
     pub fn operator_logout(operator_id: &[u8], timestamp_ms: u64) -> Self {
-        let op_len = operator_id.len().min(32);
-        let mut op_buf = [0u8; 32];
-        op_buf[..op_len].copy_from_slice(&operator_id[..op_len]);
-
+        let (operator_id_len, operator_id) = truncated(operator_id);
         Self {
             kind: WorkEventKind::OperatorLogout,
-            operator_id_len: op_len as u8,
-            operator_id: op_buf,
+            operator_id_len,
+            operator_id,
             job_id_len: 0,
-            job_id: [0u8; 64],
+            job_id: [0u8; JOB_ID_CAP],
             timestamp_ms,
             duration_ms: 0,
         }
@@ -594,15 +684,15 @@ impl WorkEventPayload {
         let mut r = ByteReader::new(bytes);
         let kind = WorkEventKind::try_from(r.read_u8()?)?;
         let operator_id_len = r.read_u8()?;
-        if operator_id_len > 32 {
+        if (operator_id_len as usize) > OPERATOR_ID_CAP {
             return Err(PacketError::InvalidPayload);
         }
-        let operator_id = r.read_array::<32>()?;
+        let operator_id = r.read_array::<OPERATOR_ID_CAP>()?;
         let job_id_len = r.read_u8()?;
-        if job_id_len > 64 {
+        if (job_id_len as usize) > JOB_ID_CAP {
             return Err(PacketError::InvalidPayload);
         }
-        let job_id = r.read_array::<64>()?;
+        let job_id = r.read_array::<JOB_ID_CAP>()?;
         let timestamp_ms = r.read_u64_le()?;
         let duration_ms = r.read_u64_le()?;
         Ok(Self {
@@ -615,13 +705,35 @@ impl WorkEventPayload {
             duration_ms,
         })
     }
+
+    #[inline]
+    pub fn operator_id_bytes(&self) -> &[u8] {
+        let len = (self.operator_id_len as usize).min(self.operator_id.len());
+        &self.operator_id[..len]
+    }
+
+    #[inline]
+    pub fn job_id_bytes(&self) -> &[u8] {
+        let len = (self.job_id_len as usize).min(self.job_id.len());
+        &self.job_id[..len]
+    }
 }
+impl Payload for WorkEventPayload {
+    const MSG_TYPE: MsgType = MsgType::Data;
+    const LEN: usize = Self::LEN;
+
+    fn encode(&self, out: &mut [u8]) -> Result<(), PacketError> {
+        Self::encode(self, out)
+    }
+}
+
 
 // ===========================================================================
 // Key Derivation & Nonce Helpers
 // ===========================================================================
 
 pub const SESSION_KEY_INFO: &[u8] = b"TRILLBY_SESSION_KEY_V1";
+const KDF_SALT_LEN: usize = 32 + 32 + 4;
 
 /// Derive the symmetric session key using HKDF-SHA256 (RFC 5869):
 /// PRK = HKDF-Extract(salt = client_nonce || server_nonce || session_salt, IKM = psk)
@@ -632,7 +744,7 @@ pub fn derive_session_key(
     client_nonce: &[u8; 32],
     server_nonce: &[u8; 32],
 ) -> [u8; 32] {
-    let mut nonce_salt = [0u8; 68];
+    let mut nonce_salt = [0u8; KDF_SALT_LEN];
     let mut w = ByteWriter::new(&mut nonce_salt);
     let _ = w.write_bytes(client_nonce);
     let _ = w.write_bytes(server_nonce);
@@ -642,6 +754,46 @@ pub fn derive_session_key(
     let mut key = [0u8; 32];
     let _ = hkdf_expand(&prk, SESSION_KEY_INFO, &mut key);
     key
+}
+
+fn write_frame_header(
+    header: &FrameHeader,
+    payload_len: usize,
+    tag_len: usize,
+    frame_buf: &mut [u8],
+) -> Result<([u8; HEADER_LEN], usize), PacketError> {
+    let full_payload_len = payload_len + tag_len;
+    let total_len = HEADER_LEN + full_payload_len;
+    if total_len > frame_buf.len() || full_payload_len > (MAX_PAYLOAD_LEN as usize) {
+        return Err(PacketError::PayloadTooLarge);
+    }
+    let mut header_bytes = [0u8; HEADER_LEN];
+    header.encode(&mut header_bytes);
+    frame_buf[..HEADER_LEN].copy_from_slice(&header_bytes);
+    Ok((header_bytes, total_len))
+}
+
+fn write_frame_prefix(
+    header: &FrameHeader,
+    payload: &[u8],
+    tag_len: usize,
+    frame_buf: &mut [u8],
+) -> Result<([u8; HEADER_LEN], usize), PacketError> {
+    let (header_bytes, total_len) = write_frame_header(header, payload.len(), tag_len, frame_buf)?;
+    frame_buf[HEADER_LEN..HEADER_LEN + payload.len()].copy_from_slice(payload);
+    Ok((header_bytes, total_len))
+}
+
+fn split_frame(frame_buf: &[u8], tag_len: usize) -> Result<(FrameHeader, usize), PacketError> {
+    if frame_buf.len() < HEADER_LEN + tag_len {
+        return Err(PacketError::BufferTooShort);
+    }
+    let header = FrameHeader::decode(&frame_buf[..HEADER_LEN])?;
+    let expected_payload_len = header.payload_len as usize;
+    if frame_buf[HEADER_LEN..].len() < expected_payload_len || expected_payload_len < tag_len {
+        return Err(PacketError::BufferTooShort);
+    }
+    Ok((header, expected_payload_len))
 }
 
 /// Assemble and HMAC-authenticate an unencrypted handshake frame.
@@ -654,21 +806,41 @@ pub fn pack_and_authenticate_hmac(
     payload: &[u8],
     frame_buf: &mut [u8],
 ) -> Result<usize, PacketError> {
-    let payload_len = payload.len() + HMAC_TAG_LEN;
-    let total_len = HEADER_LEN + payload_len;
-    if total_len > frame_buf.len() || payload_len > (MAX_PAYLOAD_LEN as usize) {
-        return Err(PacketError::PayloadTooLarge);
-    }
-
-    let header = FrameHeader::new(msg_type, session_id, seq_num, payload_len as u16);
-    let mut header_bytes = [0u8; HEADER_LEN];
-    header.encode(&mut header_bytes);
-
-    frame_buf[..HEADER_LEN].copy_from_slice(&header_bytes);
-    frame_buf[HEADER_LEN..HEADER_LEN + payload.len()].copy_from_slice(payload);
+    let header = FrameHeader::new(
+        msg_type,
+        session_id,
+        seq_num,
+        (payload.len() + HMAC_TAG_LEN) as u16,
+    );
+    let (_, total_len) = write_frame_prefix(&header, payload, HMAC_TAG_LEN, frame_buf)?;
 
     let tag = hmac_sha256(key, &frame_buf[..HEADER_LEN + payload.len()]);
     frame_buf[HEADER_LEN + payload.len()..total_len].copy_from_slice(&tag);
+
+    Ok(total_len)
+}
+
+/// Assemble and HMAC-authenticate an unencrypted handshake frame where the payload
+/// is already written into `frame_buf[HEADER_LEN..HEADER_LEN + payload_len]`.
+/// Returns total frame length (16-byte header + payload + 32-byte HMAC-SHA256 tag).
+pub fn pack_and_authenticate_hmac_inplace(
+    key: &[u8; 32],
+    msg_type: MsgType,
+    session_id: u32,
+    seq_num: u32,
+    payload_len: usize,
+    frame_buf: &mut [u8],
+) -> Result<usize, PacketError> {
+    let header = FrameHeader::new(
+        msg_type,
+        session_id,
+        seq_num,
+        (payload_len + HMAC_TAG_LEN) as u16,
+    );
+    let (_, total_len) = write_frame_header(&header, payload_len, HMAC_TAG_LEN, frame_buf)?;
+
+    let tag = hmac_sha256(key, &frame_buf[..HEADER_LEN + payload_len]);
+    frame_buf[HEADER_LEN + payload_len..total_len].copy_from_slice(&tag);
 
     Ok(total_len)
 }
@@ -679,15 +851,7 @@ pub fn verify_and_unpack_hmac<'a>(
     key: &[u8; 32],
     frame_buf: &'a [u8],
 ) -> Result<(FrameHeader, &'a [u8]), PacketError> {
-    if frame_buf.len() < HEADER_LEN + HMAC_TAG_LEN {
-        return Err(PacketError::BufferTooShort);
-    }
-
-    let header = FrameHeader::decode(&frame_buf[..HEADER_LEN])?;
-    let expected_payload_len = header.payload_len as usize;
-    if frame_buf.len() < HEADER_LEN + expected_payload_len || expected_payload_len < HMAC_TAG_LEN {
-        return Err(PacketError::BufferTooShort);
-    }
+    let (header, expected_payload_len) = split_frame(frame_buf, HMAC_TAG_LEN)?;
 
     let data_len = expected_payload_len - HMAC_TAG_LEN;
     let authenticated_len = HEADER_LEN + data_len;
@@ -701,6 +865,8 @@ pub fn verify_and_unpack_hmac<'a>(
     Ok((header, &frame_buf[HEADER_LEN..authenticated_len]))
 }
 
+const CLIENT_NONCE_INPUT_LEN: usize = 32 + 16 + 8 + 8; // 32 PSK + 16 UUID + 8 timestamp_ms + 8 pad = 64
+
 /// Generate a pseudo-random client nonce derived from PSK + device UUID + monotonic timestamp:
 /// SHA-256(PSK || UUID || timestamp_ms)
 pub fn generate_client_nonce(
@@ -708,7 +874,7 @@ pub fn generate_client_nonce(
     device_uuid: &[u8; 16],
     timestamp_ms: u64,
 ) -> [u8; 32] {
-    let mut prk_input = [0u8; 64];
+    let mut prk_input = [0u8; CLIENT_NONCE_INPUT_LEN];
     let mut w = ByteWriter::new(&mut prk_input);
     let _ = w.write_bytes(psk);
     let _ = w.write_bytes(device_uuid);
@@ -733,27 +899,21 @@ pub fn pack_and_encrypt_directed(
     plaintext: &[u8],
     frame_buf: &mut [u8],
 ) -> Result<usize, PacketError> {
-    let payload_len = plaintext.len() + TAG_LEN;
-    let total_len = HEADER_LEN + payload_len;
-    if total_len > frame_buf.len() || payload_len > (MAX_PAYLOAD_LEN as usize) {
-        return Err(PacketError::PayloadTooLarge);
-    }
-
-    let mut header = FrameHeader::new(msg_type, session_id, seq_num, payload_len as u16);
-    if direction == Direction::ClientToServer {
-        header.flags |= FLAG_CLIENT_TO_SERVER;
-    }
-    let mut header_bytes = [0u8; HEADER_LEN];
-    header.encode(&mut header_bytes);
-
-    frame_buf[..HEADER_LEN].copy_from_slice(&header_bytes);
-    frame_buf[HEADER_LEN..HEADER_LEN + plaintext.len()].copy_from_slice(plaintext);
+    let mut header = FrameHeader::new(
+        msg_type,
+        session_id,
+        seq_num,
+        (plaintext.len() + TAG_LEN) as u16,
+    );
+    header.set_direction(direction);
+    let (header_bytes, total_len) =
+        write_frame_prefix(&header, plaintext, TAG_LEN, frame_buf)?;
 
     let nonce = header.derive_nonce(salt);
     let pt_and_tag = &mut frame_buf[HEADER_LEN..total_len];
 
     chacha20_poly1305_encrypt(key, &nonce, &header_bytes, pt_and_tag)
-        .map_err(|_| PacketError::PayloadTooLarge)?;
+        .map_err(|_| PacketError::EncryptionFailed)?;
 
     Ok(total_len)
 }
@@ -787,17 +947,9 @@ pub fn decrypt_and_unpack<'a>(
     salt: &[u8; 4],
     frame_buf: &'a mut [u8],
 ) -> Result<(FrameHeader, &'a [u8]), PacketError> {
-    if frame_buf.len() < HEADER_LEN + TAG_LEN {
-        return Err(PacketError::BufferTooShort);
-    }
+    let (header, expected_payload_len) = split_frame(frame_buf, TAG_LEN)?;
 
     let (header_slice, rest) = frame_buf.split_at_mut(HEADER_LEN);
-    let header = FrameHeader::decode(header_slice)?;
-
-    let expected_payload_len = header.payload_len as usize;
-    if rest.len() < expected_payload_len || expected_payload_len < TAG_LEN {
-        return Err(PacketError::BufferTooShort);
-    }
 
     let nonce = header.derive_nonce(salt);
     let ct_and_tag = &mut rest[..expected_payload_len];
@@ -821,6 +973,27 @@ mod tests {
         assert_eq!(hdr, decoded);
     }
 
+
+    #[test]
+    fn test_header_direction() {
+        let mut hdr = FrameHeader::new(MsgType::Data, 7, 9, 0);
+        hdr.set_direction(Direction::ClientToServer);
+        let mut buf = [0u8; HEADER_LEN];
+        hdr.encode(&mut buf);
+        let decoded = FrameHeader::decode(&buf).unwrap();
+        assert!(decoded.is_direction(Direction::ClientToServer));
+        assert!(!decoded.is_direction(Direction::ServerToClient));
+        let flags = u16::from_le_bytes([buf[HEADER_LEN - 2], buf[HEADER_LEN - 1]]);
+        assert!((flags & FLAG_CLIENT_TO_SERVER) != 0);
+
+        hdr.set_direction(Direction::ServerToClient);
+        hdr.encode(&mut buf);
+        let decoded2 = FrameHeader::decode(&buf).unwrap();
+        assert!(decoded2.is_direction(Direction::ServerToClient));
+        assert!(!decoded2.is_direction(Direction::ClientToServer));
+        let flags2 = u16::from_le_bytes([buf[HEADER_LEN - 2], buf[HEADER_LEN - 1]]);
+        assert_eq!(flags2 & FLAG_CLIENT_TO_SERVER, 0);
+    }
     #[test]
     fn test_pack_and_encrypt_round_trip() {
         let key = [0x55u8; 32];
@@ -1052,6 +1225,31 @@ mod tests {
     }
 
     #[test]
+    fn test_hmac_handshake_inplace_round_trip() {
+        let key = [0x42u8; 32];
+        let init = HandshakeInitPayload {
+            client_nonce: [0x11u8; 32],
+            device_uuid: [0x22u8; 16],
+        };
+
+        let mut frame_buf = [0u8; MAX_FRAME_LEN];
+        init.encode(&mut frame_buf[HEADER_LEN..HEADER_LEN + HandshakeInitPayload::LEN]).unwrap();
+        let len = pack_and_authenticate_hmac_inplace(
+            &key,
+            MsgType::HandshakeInit,
+            0,
+            0,
+            HandshakeInitPayload::LEN,
+            &mut frame_buf,
+        ).unwrap();
+
+        let (hdr, payload) = verify_and_unpack_hmac(&key, &frame_buf[..len]).unwrap();
+        assert_eq!(hdr.msg_type, MsgType::HandshakeInit);
+        let decoded = HandshakeInitPayload::decode(payload).unwrap();
+        assert_eq!(decoded, init);
+    }
+
+    #[test]
     fn test_work_event_payload_round_trip_and_clamping() {
         let start = WorkEventPayload::work_start(b"OP-0042", b"WO-55102", 123_456);
         assert_eq!(start.kind, WorkEventKind::WorkStart);
@@ -1079,16 +1277,39 @@ mod tests {
         logout.encode(&mut buf).unwrap();
         assert_eq!(WorkEventPayload::decode(&buf).unwrap(), logout);
 
-        // Over-length operator_id (> 32) and job_id (> 64) are clamped
-        let long_op = [b'A'; 40];
-        let long_job = [b'B'; 80];
+        // Over-length operator_id (> OPERATOR_ID_CAP) and job_id (> JOB_ID_CAP) are clamped
+        let long_op = [b'A'; OPERATOR_ID_CAP + 8];
+        let long_job = [b'B'; JOB_ID_CAP + 16];
         let clamped = WorkEventPayload::work_start(&long_op, &long_job, 999);
-        assert_eq!(clamped.operator_id_len, 32);
-        assert_eq!(clamped.operator_id, [b'A'; 32]);
-        assert_eq!(clamped.job_id_len, 64);
-        assert_eq!(clamped.job_id, [b'B'; 64]);
+        assert_eq!(clamped.operator_id_len, OPERATOR_ID_CAP as u8);
+        assert_eq!(clamped.operator_id, [b'A'; OPERATOR_ID_CAP]);
+        assert_eq!(clamped.job_id_len, JOB_ID_CAP as u8);
+        assert_eq!(clamped.job_id, [b'B'; JOB_ID_CAP]);
         clamped.encode(&mut buf).unwrap();
         assert_eq!(WorkEventPayload::decode(&buf).unwrap(), clamped);
+        assert_eq!(start.operator_id_bytes(), b"OP-0042");
+        assert_eq!(start.job_id_bytes(), b"WO-55102");
+        assert_eq!(logout.operator_id_bytes(), b"OP-0042");
+        assert_eq!(logout.job_id_bytes(), b"");
+        assert_eq!(clamped.operator_id_bytes(), &[b'A'; OPERATOR_ID_CAP]);
+        assert_eq!(clamped.job_id_bytes(), &[b'B'; JOB_ID_CAP]);
+    }
+
+    #[test]
+    fn test_auth_init_payload_new_and_clamping() {
+        let auth = AuthInitPayload::new(b"OP-0042", 123_456);
+        assert_eq!(auth.auth_data_len, 7);
+        assert_eq!(&auth.auth_data[..7], b"OP-0042");
+        assert_eq!(&auth.auth_data[7..], &[0u8; 25]);
+        assert_eq!(auth.timestamp_ms, 123_456);
+
+        let long_auth = [b'X'; OPERATOR_ID_CAP + 13];
+        let clamped = AuthInitPayload::new(&long_auth, 999);
+        assert_eq!(clamped.auth_data_len, OPERATOR_ID_CAP as u8);
+        assert_eq!(clamped.auth_data, [b'X'; OPERATOR_ID_CAP]);
+        assert_eq!(clamped.timestamp_ms, 999);
+        assert_eq!(auth.auth_data_bytes(), b"OP-0042");
+        assert_eq!(clamped.auth_data_bytes(), &[b'X'; OPERATOR_ID_CAP]);
     }
 
     #[test]
@@ -1122,17 +1343,17 @@ mod tests {
             Err(PacketError::InvalidPayload)
         );
 
-        // operator_id_len > 32
+        // operator_id_len > OPERATOR_ID_CAP
         let mut bad_op_len = buf;
-        bad_op_len[1] = 33;
+        bad_op_len[1] = (OPERATOR_ID_CAP + 1) as u8;
         assert_eq!(
             WorkEventPayload::decode(&bad_op_len),
             Err(PacketError::InvalidPayload)
         );
 
-        // job_id_len > 64 (offset 1 + 1 + 32 = 34)
+        // job_id_len > JOB_ID_CAP (offset 1 + 1 + OPERATOR_ID_CAP)
         let mut bad_job_len = buf;
-        bad_job_len[34] = 65;
+        bad_job_len[1 + 1 + OPERATOR_ID_CAP] = (JOB_ID_CAP + 1) as u8;
         assert_eq!(
             WorkEventPayload::decode(&bad_job_len),
             Err(PacketError::InvalidPayload)
@@ -1248,7 +1469,7 @@ mod tests {
         auth_init.encode(&mut valid_auth_buf).unwrap();
 
         let mut buf_33 = valid_auth_buf;
-        buf_33[0] = 33;
+        buf_33[0] = (OPERATOR_ID_CAP + 1) as u8;
         assert_eq!(AuthInitPayload::decode(&buf_33), Err(PacketError::InvalidPayload));
 
         let mut buf_255 = valid_auth_buf;
@@ -1391,4 +1612,5 @@ mod tests {
         diff_server_nonce[0] ^= 0x01;
         assert_ne!(derive_session_key(&psk, &salt, &client_nonce, &diff_server_nonce), base_key);
     }
+
 }

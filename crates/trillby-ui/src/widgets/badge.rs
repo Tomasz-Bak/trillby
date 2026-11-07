@@ -14,7 +14,6 @@ pub enum BadgeVariant {
     Success,
     Warning,
     Info,
-    Danger,
 }
 
 pub struct Badge<'a> {
@@ -42,12 +41,12 @@ impl<'a> Badge<'a> {
         D: DrawTarget<Color = Rgb565>,
         C: Theme,
     {
-        let (bg_color, text_color) = match self.variant {
-            BadgeVariant::Success => (theme.success(), theme.primary_text()),
-            BadgeVariant::Warning => (theme.warning(), theme.primary_text()),
-            BadgeVariant::Info => (theme.primary(), theme.primary_text()),
-            BadgeVariant::Danger => (theme.danger(), theme.primary_text()),
+        let bg_color = match self.variant {
+            BadgeVariant::Success => theme.success(),
+            BadgeVariant::Warning => theme.warning(),
+            BadgeVariant::Info => theme.primary(),
         };
+        let text_color = theme.primary_text();
 
         let font = theme.font_small();
         let char_w = font.character_size.width;

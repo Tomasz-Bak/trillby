@@ -5,9 +5,12 @@ use crate::geometry::{Point, Rect};
 
 pub const HEADER_HEIGHT: u32 = 36;
 
-pub const DEBUG_BUTTON: Rect = Rect::new(Point::new(410, 4), 110, 28);
-pub const KEYBOARD_BUTTON: Rect = Rect::new(Point::new(530, 4), 120, 28);
-pub const CLEAR_BUTTON: Rect = Rect::new(Point::new(660, 4), 120, 28);
+pub const HEADER_BUTTON_INSET: i32 = 4;
+pub const HEADER_BUTTON_H: u32 = HEADER_HEIGHT - 2 * HEADER_BUTTON_INSET as u32;
+
+pub const DEBUG_BUTTON: Rect = Rect::new(Point::new(410, HEADER_BUTTON_INSET), 110, HEADER_BUTTON_H);
+pub const KEYBOARD_BUTTON: Rect = Rect::new(Point::new(530, HEADER_BUTTON_INSET), 120, HEADER_BUTTON_H);
+pub const CLEAR_BUTTON: Rect = Rect::new(Point::new(660, HEADER_BUTTON_INSET), 120, HEADER_BUTTON_H);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HeaderButton {
@@ -28,22 +31,27 @@ impl HeaderButton {
     /// Hit-test a touch against the header buttons. The hit area spans the
     /// full header height (not just the drawn button) for fat-finger tolerance.
     pub fn at(p: Point) -> Option<Self> {
-        if p.y < 0 || p.y >= HEADER_HEIGHT as i32 {
-            return None;
-        }
         [Self::Debug, Self::Keyboard, Self::Clear]
             .into_iter()
             .find(|b| {
                 let r = b.rect();
-                p.x >= r.top_left.x && p.x < r.top_left.x + r.width as i32
+                Rect::new(Point::new(r.top_left.x, 0), r.width, HEADER_HEIGHT).contains(p)
             })
     }
 }
 
-pub const DEBUG_AUTH_USER_BUTTON: Rect = Rect::new(Point::new(287, 190), 109, 36);
-pub const DEBUG_START_JOB_BUTTON: Rect = Rect::new(Point::new(404, 190), 109, 36);
-pub const DEBUG_STOP_JOB_BUTTON: Rect = Rect::new(Point::new(287, 234), 109, 36);
-pub const DEBUG_LOGOUT_BUTTON: Rect = Rect::new(Point::new(404, 234), 109, 36);
+pub const DEBUG_PANEL: Rect = Rect::new(Point::new(275, 96), 250, 180);
+
+const fn debug_button_rect(col: u32, row: u32) -> Rect {
+    let x = DEBUG_PANEL.top_left.x + 12 + (col as i32 * 117);
+    let y = DEBUG_PANEL.top_left.y + 94 + (row as i32 * 44);
+    Rect::new(Point::new(x, y), 109, 36)
+}
+
+pub const DEBUG_AUTH_USER_BUTTON: Rect = debug_button_rect(0, 0);
+pub const DEBUG_START_JOB_BUTTON: Rect = debug_button_rect(1, 0);
+pub const DEBUG_STOP_JOB_BUTTON: Rect = debug_button_rect(0, 1);
+pub const DEBUG_LOGOUT_BUTTON: Rect = debug_button_rect(1, 1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DebugButton {

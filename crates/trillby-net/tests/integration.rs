@@ -1,56 +1,19 @@
+mod support;
+
 use trillby_net::{
-    AuthInitPayload, AuthRespPayload, ClientState, MsgType, NetClient, NetServer, ServerEvent,
+    AuthInitPayload, AuthRespPayload, ClientState, MsgType, NetClient, ServerEvent,
     WorkEventKind, WorkEventPayload,
 };
 use trillby_core::net_types::NetworkStatus;
 
-fn step_client<const CAP: usize, F>(
-    client: &mut NetClient<CAP>,
-    now_ms: u64,
-    on_data: F,
-) -> Option<NetworkStatus>
-where
-    F: FnMut(MsgType, &[u8]),
-{
-    let fd = client.socket_fd();
-    let revents = if fd >= 0 {
-        let mut pfd = libc::pollfd {
-            fd,
-            events: libc::POLLIN | libc::POLLOUT,
-            revents: 0,
-        };
-        let ret = unsafe { libc::poll(&mut pfd, 1, 10) };
-        if ret > 0 { pfd.revents } else { 0 }
-    } else {
-        0
-    };
-    client.poll_step_with(now_ms, revents, on_data)
-}
 
 #[test]
 fn test_end_to_end_handshake_and_work_event_flow() {
     let psk = [0x42u8; 32];
     let device_uuid = [0xAAu8; 16];
 
-    let mut server = NetServer::<4>::bind([127, 0, 0, 1], 0).expect("bind NetServer");
-    let port = server.port();
-    let mut client = NetClient::<16>::new(psk, device_uuid, [127, 0, 0, 1], port);
-
-    let mut now_ms = 1000u64;
-
-    // 1. Initial state is Offline
-    assert_eq!(client.status(), NetworkStatus::Offline);
-
-    // 2. Drive handshake across loopback
+    let (mut server, mut client, mut now_ms) = support::online_pair(psk, device_uuid);
     let psk_resolver = |uuid: &[u8; 16]| if *uuid == device_uuid { Some(psk) } else { None };
-
-    for _ in 0..5 {
-        now_ms += 10;
-        step_client(&mut client, now_ms, |_, _| {});
-        server.step(now_ms, psk_resolver, |_| {});
-    }
-
-    assert_eq!(client.status(), NetworkStatus::Online);
     assert_eq!(server.active_client_count(), 1);
     assert!(server.is_client_online(0));
 
@@ -61,7 +24,7 @@ fn test_end_to_end_handshake_and_work_event_flow() {
 
     // 4. Client flushes frame; Server receives and auto-ACKs
     now_ms += 10;
-    step_client(&mut client, now_ms, |_, _| {});
+    client.wait_and_step_with(now_ms, 10, |_, _| {});
 
     let mut received_event = [0u8; 64];
     let mut received_len = 0;
@@ -77,7 +40,7 @@ fn test_end_to_end_handshake_and_work_event_flow() {
 
     // 5. Client receives auto-ACK -> outbox is drained
     now_ms += 10;
-    step_client(&mut client, now_ms, |_, _| {});
+    client.wait_and_step_with(now_ms, 10, |_, _| {});
     assert_eq!(client.outbox_pending_count(), 0);
 
     // 6. Server pushes an application command down to client
@@ -87,7 +50,7 @@ fn test_end_to_end_handshake_and_work_event_flow() {
     let mut client_received = [0u8; 64];
     let mut client_received_len = 0;
     now_ms += 10;
-    step_client(&mut client, now_ms, |msg_type, data| {
+    client.wait_and_step_with(now_ms, 10, |msg_type, data| {
         assert_eq!(msg_type, MsgType::Data);
         client_received[..data.len()].copy_from_slice(data);
         client_received_len = data.len();
@@ -100,11 +63,11 @@ fn test_end_to_end_handshake_and_work_event_flow() {
         auth_data: [1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
         timestamp_ms: now_ms,
     };
-    client.send_auth(&auth_req).unwrap();
+    client.send_payload(&auth_req).unwrap();
     assert_eq!(client.outbox_pending_count(), 1);
 
     now_ms += 10;
-    step_client(&mut client, now_ms, |_, _| {});
+    client.wait_and_step_with(now_ms, 10, |_, _| {});
 
     let mut auth_received = false;
     server.step(now_ms, psk_resolver, |event| {
@@ -127,7 +90,7 @@ fn test_end_to_end_handshake_and_work_event_flow() {
 
     now_ms += 10;
     let mut client_auth_resp = false;
-    step_client(&mut client, now_ms, |msg_type, data| {
+    client.wait_and_step_with(now_ms, 10, |msg_type, data| {
         if msg_type == MsgType::AuthResp {
             let resp = AuthRespPayload::decode(data).unwrap();
             assert_eq!(resp.status, 0);
@@ -146,34 +109,23 @@ fn test_send_work_event_end_to_end() {
     let psk = [0x42u8; 32];
     let device_uuid = [0xCCu8; 16];
 
-    let mut server = NetServer::<4>::bind([127, 0, 0, 1], 0).expect("bind NetServer");
-    let port = server.port();
-    let mut client = NetClient::<16>::new(psk, device_uuid, [127, 0, 0, 1], port);
-
-    let mut now_ms = 1000u64;
+    let (mut server, mut client, mut now_ms) = support::online_pair(psk, device_uuid);
     let psk_resolver = |uuid: &[u8; 16]| if *uuid == device_uuid { Some(psk) } else { None };
-
-    for _ in 0..5 {
-        now_ms += 10;
-        step_client(&mut client, now_ms, |_, _| {});
-        server.step(now_ms, psk_resolver, |_| {});
-    }
-    assert_eq!(client.status(), NetworkStatus::Online);
 
     // Enqueue WorkStart, WorkStop, and OperatorLogout
     let ev_start = WorkEventPayload::work_start(b"OP-0042", b"WO-55102", 1100);
     let ev_stop = WorkEventPayload::work_stop(b"OP-0042", b"WO-55102", 4600, 3500);
     let ev_logout = WorkEventPayload::operator_logout(b"OP-0042", 4700);
 
-    client.send_work_event(&ev_start).unwrap();
-    client.send_work_event(&ev_stop).unwrap();
-    client.send_work_event(&ev_logout).unwrap();
+    client.send_payload(&ev_start).unwrap();
+    client.send_payload(&ev_stop).unwrap();
+    client.send_payload(&ev_logout).unwrap();
     assert_eq!(client.outbox_pending_count(), 3);
 
     let mut received: Vec<WorkEventPayload> = Vec::new();
     for _ in 0..10 {
         now_ms += 10;
-        step_client(&mut client, now_ms, |_, _| {});
+        client.wait_and_step_with(now_ms, 10, |_, _| {});
         server.step(now_ms, psk_resolver, |event| {
             if let ServerEvent::Data { client_idx, msg_type, payload } = event {
                 assert_eq!(client_idx, 0);
@@ -280,12 +232,7 @@ fn test_directional_aead_nonce_and_reflection_isolation() {
 
     // Step 3: Peer reads HandshakeInit
     let mut init_buf = [0u8; MAX_FRAME_LEN];
-    peer_stream.set_nonblocking(false).unwrap();
-    peer_stream.read_exact(&mut init_buf[..HEADER_LEN]).unwrap();
-    let init_hdr = FrameHeader::decode(&init_buf[..HEADER_LEN]).unwrap();
-    let total_init_len = HEADER_LEN + init_hdr.payload_len as usize;
-    peer_stream.read_exact(&mut init_buf[HEADER_LEN..total_init_len]).unwrap();
-    peer_stream.set_nonblocking(true).unwrap();
+    let total_init_len = support::read_exact_frame(&mut peer_stream, &mut init_buf);
 
     let (_hdr, init_pt) = verify_and_unpack_hmac(&psk, &init_buf[..total_init_len]).unwrap();
     let init_payload = HandshakeInitPayload::decode(init_pt).unwrap();

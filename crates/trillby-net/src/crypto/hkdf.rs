@@ -1,25 +1,29 @@
 //! HKDF-SHA256 (RFC 5869).
 
 use super::hmac::{hmac_sha256, HmacSha256};
+use super::sha256::DIGEST_LEN;
 use super::wipe;
+use super::CryptoError;
 
-pub fn hkdf_extract(salt: &[u8], ikm: &[u8]) -> [u8; 32] {
+const MAX_OUTPUT: usize = 255 * DIGEST_LEN;
+
+pub fn hkdf_extract(salt: &[u8], ikm: &[u8]) -> [u8; DIGEST_LEN] {
     // An empty salt is zero-padded by HMAC, matching RFC 5869's default.
     hmac_sha256(salt, ikm)
 }
 
-pub fn hkdf_expand(prk: &[u8; 32], info: &[u8], out: &mut [u8]) -> Result<(), ()> {
-    if out.len() > 255 * 32 {
-        return Err(());
+pub fn hkdf_expand(prk: &[u8; DIGEST_LEN], info: &[u8], out: &mut [u8]) -> Result<(), CryptoError> {
+    if out.len() > MAX_OUTPUT {
+        return Err(CryptoError::OutputTooLong);
     }
 
-    // Key once; each block is a cheap copy of the prepared ipad/opad state.
-    let mut keyed = HmacSha256::new(prk);
-    let mut t = [0u8; 32];
+    // Key once; each block is a clone of the prepared ipad/opad state.
+    let keyed = HmacSha256::new(prk);
+    let mut t = [0u8; DIGEST_LEN];
 
-    // `out.len() <= 255*32` bounds the chunk count to 255, so `i + 1` fits u8.
-    for (i, chunk) in out.chunks_mut(32).enumerate() {
-        let mut mac = keyed;
+    // `out.len() <= MAX_OUTPUT` bounds the chunk count to 255, so `i + 1` fits u8.
+    for (i, chunk) in out.chunks_mut(DIGEST_LEN).enumerate() {
+        let mut mac = keyed.clone();
         if i > 0 {
             mac.update(&t);
         }
@@ -30,7 +34,6 @@ pub fn hkdf_expand(prk: &[u8; 32], info: &[u8], out: &mut [u8]) -> Result<(), ()
     }
 
     wipe(&mut t);
-    keyed.wipe();
     Ok(())
 }
 
@@ -43,20 +46,15 @@ mod tests {
     fn test_hkdf_sha256_vector() {
         // RFC 5869 Test Case 1
         let ikm = [0x0bu8; 22];
-        let salt = [
-            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-            0x08, 0x09, 0x0a, 0x0b, 0x0c
-        ];
-        let info = [0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9];
+        let salt = hex::<13>("00 01 02 03 04 05 06 07 08 09 0a 0b 0c");
+        let info = hex::<10>("f0 f1 f2 f3 f4 f5 f6 f7 f8 f9");
         let prk = hkdf_extract(&salt, &ikm);
         assert_eq!(
             prk,
-            [
-                0x07, 0x77, 0x09, 0x36, 0x2c, 0x2e, 0x32, 0xdf,
-                0x0d, 0xdc, 0x3f, 0x0d, 0xc4, 0x7b, 0xba, 0x63,
-                0x90, 0xb6, 0xc7, 0x3b, 0xb5, 0x0f, 0x9c, 0x31,
-                0x22, 0xec, 0x84, 0x4a, 0xd7, 0xc2, 0xb3, 0xe5
-            ]
+            hex::<32>(
+                "07 77 09 36 2c 2e 32 df 0d dc 3f 0d c4 7b ba 63 \
+                 90 b6 c7 3b b5 0f 9c 31 22 ec 84 4a d7 c2 b3 e5"
+            )
         );
 
         // Full 42 bytes: block 2 is the only path that chains T(1).

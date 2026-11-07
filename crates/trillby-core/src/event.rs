@@ -9,5 +9,4 @@ pub enum UiEvent {
     RfidScanned(String<32>),
     BarcodeScanned(String<64>),
     NetworkStatusChanged(crate::net_types::NetworkStatus),
-    Tick,
 }

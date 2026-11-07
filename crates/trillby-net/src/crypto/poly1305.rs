@@ -5,6 +5,8 @@
 
 use super::wipe;
 
+pub const TAG_LEN: usize = 16;
+
 #[inline(always)]
 fn add_carry_u64(a: u64, b: u64, carry: bool) -> (u64, bool) {
     let (s1, c1) = a.overflowing_add(b);
@@ -12,7 +14,7 @@ fn add_carry_u64(a: u64, b: u64, carry: bool) -> (u64, bool) {
     (s2, c1 || c2)
 }
 
-pub struct Poly1305 {
+pub(crate) struct Poly1305 {
     r0: u64,
     r1: u64,
     /// `5 * r1 / 4`, used to fold limbs at weight 2^128 and 2^192 back down.
@@ -23,8 +25,7 @@ pub struct Poly1305 {
     h0: u64,
     h1: u64,
     h2: u64,
-    buffer: [u8; 16],
-    buf_len: usize,
+    buffer: super::BlockBuffer<TAG_LEN>,
 }
 
 impl Poly1305 {
@@ -43,8 +44,7 @@ impl Poly1305 {
             h0: 0,
             h1: 0,
             h2: 0,
-            buffer: [0u8; 16],
-            buf_len: 0,
+            buffer: super::BlockBuffer::new(),
         }
     }
 
@@ -76,36 +76,26 @@ impl Poly1305 {
         self.h2 = (d2 as u64 & 3) + c as u64;
     }
 
-    pub fn update(&mut self, mut data: &[u8]) {
-        if self.buf_len > 0 {
-            let needed = 16 - self.buf_len;
-            if data.len() < needed {
-                self.buffer[self.buf_len..self.buf_len + data.len()].copy_from_slice(data);
-                self.buf_len += data.len();
-                return;
-            }
-            self.buffer[self.buf_len..].copy_from_slice(&data[..needed]);
-            let b = self.buffer;
-            self.block(&b, 1);
-            self.buf_len = 0;
-            data = &data[needed..];
-        }
-
-        let mut blocks = data.chunks_exact(16);
-        for b in &mut blocks {
-            self.block(b.try_into().unwrap(), 1);
-        }
-
-        let rem = blocks.remainder();
-        self.buffer[..rem.len()].copy_from_slice(rem);
-        self.buf_len = rem.len();
+    pub fn update(&mut self, data: &[u8]) {
+        let mut buf = self.buffer;
+        buf.absorb(data, |b| self.block(b, 1));
+        self.buffer = buf;
     }
 
-    pub fn finalize(mut self) -> [u8; 16] {
-        if self.buf_len > 0 {
-            let mut b = [0u8; 16];
-            b[..self.buf_len].copy_from_slice(&self.buffer[..self.buf_len]);
-            b[self.buf_len] = 0x01; // explicit 1-bit, so no implicit 2^128
+    pub fn pad16(&mut self) {
+        if self.buffer.len > 0 {
+            self.buffer.buf[self.buffer.len..].fill(0);
+            let b = self.buffer.buf;
+            self.block(&b, 1);
+            self.buffer.len = 0;
+        }
+    }
+
+    pub fn finalize(mut self) -> [u8; TAG_LEN] {
+        if self.buffer.len > 0 {
+            let mut b = [0u8; TAG_LEN];
+            b[..self.buffer.len].copy_from_slice(self.buffer.pending());
+            b[self.buffer.len] = 0x01; // explicit 1-bit, so no implicit 2^128
             self.block(&b, 0);
             wipe(&mut b);
         }
@@ -130,7 +120,7 @@ impl Poly1305 {
         let (t0, c) = h0.overflowing_add(self.s0);
         let (t1, _) = add_carry_u64(h1, self.s1, c);
 
-        let mut tag = [0u8; 16];
+        let mut tag = [0u8; TAG_LEN];
         tag[..8].copy_from_slice(&t0.to_le_bytes());
         tag[8..].copy_from_slice(&t1.to_le_bytes());
         tag
@@ -147,7 +137,7 @@ impl Drop for Poly1305 {
         wipe(&mut self.h0);
         wipe(&mut self.h1);
         wipe(&mut self.h2);
-        wipe(&mut self.buffer);
+        self.buffer.wipe();
     }
 }
 
@@ -249,5 +239,29 @@ mod tests {
         );
         assert_eq!(mac(&rs(r, ZERO), &msg), hex::<16>("14000000000000005500000000000000"));
         assert_eq!(mac(&rs(r, ZERO), &msg[..48]), hex::<16>("13000000000000000000000000000000"));
+    }
+
+    #[test]
+    fn test_poly1305_pad16() {
+        let key = hex::<32>(
+            "85d6be7857556d337f4452fe42d506a8 0103808afb0db2fd4abff6af4149f51b",
+        );
+        let mut p1 = Poly1305::new(&key);
+        p1.update(b"hello");
+        p1.pad16();
+
+        let mut p2 = Poly1305::new(&key);
+        p2.update(b"hello\0\0\0\0\0\0\0\0\0\0\0");
+
+        assert_eq!(p1.finalize(), p2.finalize());
+
+        let mut p3 = Poly1305::new(&key);
+        p3.update(b"0123456789abcdef");
+        p3.pad16();
+
+        let mut p4 = Poly1305::new(&key);
+        p4.update(b"0123456789abcdef");
+
+        assert_eq!(p3.finalize(), p4.finalize());
     }
 }

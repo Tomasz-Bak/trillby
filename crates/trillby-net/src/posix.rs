@@ -3,10 +3,7 @@
 //! Encapsulates all unsafe libc syscalls into a centralized `sys` facade,
 //! providing a safe, zero-allocation socket abstraction.
 
-extern crate libc;
-
 mod sys {
-    extern crate libc;
 
     #[inline]
     pub fn last_errno() -> libc::c_int {
@@ -117,18 +114,30 @@ mod sys {
         }
     }
 
-    pub fn setsockopt_reuseaddr(fd: libc::c_int) -> Result<(), libc::c_int> {
-        let opt: libc::c_int = 1;
+    pub fn setsockopt_int(
+        fd: libc::c_int,
+        level: libc::c_int,
+        name: libc::c_int,
+        value: libc::c_int,
+    ) -> Result<(), libc::c_int> {
         unsafe {
             cvt_int(libc::setsockopt(
                 fd,
-                libc::SOL_SOCKET,
-                libc::SO_REUSEADDR,
-                &opt as *const _ as *const libc::c_void,
+                level,
+                name,
+                &value as *const _ as *const libc::c_void,
                 core::mem::size_of::<libc::c_int>() as libc::socklen_t,
             ))?;
         }
         Ok(())
+    }
+
+    pub fn setsockopt_reuseaddr(fd: libc::c_int) -> Result<(), libc::c_int> {
+        setsockopt_int(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR, 1)
+    }
+
+    pub fn set_nodelay(fd: libc::c_int) -> Result<(), libc::c_int> {
+        setsockopt_int(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY, 1)
     }
 
     pub fn getsockname_port(fd: libc::c_int) -> Result<u16, libc::c_int> {
@@ -207,12 +216,15 @@ mod sys {
         Ok(())
     }
 
+    const MS_PER_SEC: u64 = 1_000;
+    const NS_PER_MS: u64 = 1_000_000;
+
     pub fn monotonic_ms() -> u64 {
         let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
         unsafe {
             libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
         }
-        (ts.tv_sec as u64) * 1000 + (ts.tv_nsec as u64) / 1_000_000
+        (ts.tv_sec as u64) * MS_PER_SEC + (ts.tv_nsec as u64) / NS_PER_MS
     }
 }
 
@@ -225,6 +237,17 @@ pub fn monotonic_ms() -> u64 {
 /// Fill `buf` with cryptographically secure random bytes via `getrandom(2)` (or `/dev/urandom` fallback).
 pub fn fill_random(buf: &mut [u8]) -> Result<(), libc::c_int> {
     sys::fill_random(buf)
+}
+
+fn sockaddr_v4(ip: [u8; 4], port: u16) -> libc::sockaddr_in {
+    libc::sockaddr_in {
+        sin_family: libc::AF_INET as libc::sa_family_t,
+        sin_port: port.to_be(),
+        sin_addr: libc::in_addr {
+            s_addr: u32::from_ne_bytes(ip),
+        },
+        sin_zero: [0; 8],
+    }
 }
 
 pub struct PosixSocket {
@@ -242,16 +265,7 @@ impl PosixSocket {
             libc::SOCK_STREAM | libc::SOCK_NONBLOCK,
             0,
         )?;
-        let opt: libc::c_int = 1;
-        unsafe {
-            libc::setsockopt(
-                fd,
-                libc::IPPROTO_TCP,
-                libc::TCP_NODELAY,
-                &opt as *const _ as *const libc::c_void,
-                core::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-        }
+        let _ = sys::set_nodelay(fd);
         Ok(Self { fd })
     }
 
@@ -266,14 +280,7 @@ impl PosixSocket {
     /// Initiate non-blocking connection to an IPv4 address and port.
     /// Returns `Ok(true)` if connected immediately, `Ok(false)` if `EINPROGRESS`, or `Err(errno)`.
     pub fn connect_ipv4(&self, ip: [u8; 4], port: u16) -> Result<bool, libc::c_int> {
-        let addr = libc::sockaddr_in {
-            sin_family: libc::AF_INET as libc::sa_family_t,
-            sin_port: port.to_be(),
-            sin_addr: libc::in_addr {
-                s_addr: u32::from_ne_bytes(ip),
-            },
-            sin_zero: [0; 8],
-        };
+        let addr = sockaddr_v4(ip, port);
         sys::connect(self.fd, &addr)
     }
 
@@ -296,14 +303,7 @@ impl PosixSocket {
     pub fn bind_and_listen_ipv4(ip: [u8; 4], port: u16, backlog: i32) -> Result<(Self, u16), libc::c_int> {
         let sock = Self::new_nonblocking_tcp()?;
         sys::setsockopt_reuseaddr(sock.fd)?;
-        let addr = libc::sockaddr_in {
-            sin_family: libc::AF_INET as libc::sa_family_t,
-            sin_port: port.to_be(),
-            sin_addr: libc::in_addr {
-                s_addr: u32::from_ne_bytes(ip),
-            },
-            sin_zero: [0; 8],
-        };
+        let addr = sockaddr_v4(ip, port);
         sys::bind(sock.fd, &addr)?;
         sys::listen(sock.fd, backlog)?;
         let bound_port = sys::getsockname_port(sock.fd)?;
@@ -315,16 +315,7 @@ impl PosixSocket {
     pub fn accept_nonblocking(&self) -> Result<Option<Self>, libc::c_int> {
         match sys::accept(self.fd) {
             Ok(client_fd) => {
-                let opt: libc::c_int = 1;
-                unsafe {
-                    libc::setsockopt(
-                        client_fd,
-                        libc::IPPROTO_TCP,
-                        libc::TCP_NODELAY,
-                        &opt as *const _ as *const libc::c_void,
-                        core::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                    );
-                }
+                let _ = sys::set_nodelay(client_fd);
                 Ok(Some(Self { fd: client_fd }))
             }
             Err(e) if e == libc::EAGAIN || e == libc::EWOULDBLOCK => Ok(None),

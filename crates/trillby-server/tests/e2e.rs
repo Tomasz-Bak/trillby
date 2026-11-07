@@ -11,49 +11,56 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use embedded_graphics::pixelcolor::Rgb565;
+use embedded_graphics::pixelcolor::{Rgb565, RgbColor};
 use embedded_graphics::prelude::{Point, Size};
 use embedded_graphics::primitives::Rectangle;
 use embedded_graphics_framebuf::FrameBuf;
 
-use trillby_core::{NetworkStatus, SessionEvent, SessionState, UiEvent, UiState};
+use trillby_core::{NetworkStatus, SessionState, UiEvent, UiState};
 use trillby_net::client::ACK_TIMEOUT_MS;
 use trillby_net::{
-    AuthInitPayload, ClientState, HeartbeatPayload, MsgType, NetClient, NetServer, ServerEvent,
+    ClientState, HeartbeatPayload, MsgType, NetClient, NetServer, ServerEvent,
     WorkEventKind, WorkEventPayload,
 };
 use trillby_ui::{
-    core_point_to_eg, eg_rect_to_core, KeyboardGrid, LayoutZones, UiRenderer,
+    eg_rect_to_core, LayoutZones, ScreenPixels, UiRenderer, SCREEN_HEIGHT, SCREEN_WIDTH,
 };
 
-const DEV_UUID: [u8; 16] = *b"TRILLBY_0001\0\0\0\0";
-const DEV_PSK: [u8; 32] = [0x42; 32];
+const DEV_UUID: [u8; 16] = trillby_net::DEV_DEVICE_UUID;
+const DEV_PSK: [u8; 32] = trillby_net::DEV_PSK;
+const LOOPBACK: [u8; 4] = [127, 0, 0, 1];
+const LOG_WAIT: Duration = Duration::from_secs(3);
 
 pub struct SimulatedDevice {
+    pub psk: [u8; 32],
+    pub device_uuid: [u8; 16],
     pub state: UiState<256>,
     pub renderer: UiRenderer,
-    pub pixels: Box<[Rgb565; 800 * 480]>,
+    pub pixels: Box<ScreenPixels>,
     pub net_client: NetClient<32>,
     pub render_count: usize,
 }
 
 impl SimulatedDevice {
     pub fn new(psk: [u8; 32], uuid: [u8; 16], server_ip: [u8; 4], server_port: u16) -> Self {
-        let screen_bounds = Rectangle::new(Point::zero(), Size::new(800, 480));
+        let screen_bounds = Rectangle::new(Point::zero(), Size::new(SCREEN_WIDTH, SCREEN_HEIGHT));
         let mut state = UiState::new();
         let renderer = UiRenderer::new(screen_bounds);
-        let mut pixels: Box<[Rgb565; 800 * 480]> = vec![Rgb565::new(0, 0, 0); 800 * 480]
-            .into_boxed_slice()
-            .try_into()
-            .expect("800x480 framebuffer slice");
+        let mut pixels: Box<ScreenPixels> =
+            vec![Rgb565::BLACK; trillby_ui::SCREEN_PIXELS]
+                .into_boxed_slice()
+                .try_into()
+                .unwrap();
 
         {
-            let mut fb = FrameBuf::new(&mut *pixels, 800, 480);
+            let mut fb = FrameBuf::new(&mut *pixels, SCREEN_WIDTH as usize, SCREEN_HEIGHT as usize);
             renderer.render(&mut fb, &state).expect("initial render");
         }
         state.dirty = false;
 
         Self {
+            psk,
+            device_uuid: uuid,
             state,
             renderer,
             pixels,
@@ -61,84 +68,9 @@ impl SimulatedDevice {
             render_count: 1,
         }
     }
-
-    pub fn handle_ui_event(&mut self, event: UiEvent, now_ms: u64) {
-        let screen_bounds = Rectangle::new(Point::zero(), Size::new(800, 480));
-        let zones = LayoutZones::compute(screen_bounds, self.state.keyboard_visible);
-        let core_bounds = eg_rect_to_core(screen_bounds);
-        let core_kb_bounds = zones.keyboard_area.map(eg_rect_to_core);
-
-        let resolved_key = match &event {
-            UiEvent::TouchDown { scaled, .. }
-            | UiEvent::TouchUp { scaled, .. }
-            | UiEvent::TouchMove { scaled, .. } => {
-                let eg_pt = core_point_to_eg(*scaled);
-                zones
-                    .keyboard_area
-                    .and_then(|kb| KeyboardGrid::resolve_key(kb, eg_pt, self.state.keyboard_layer))
-            }
-            _ => None,
-        };
-
-        self.state
-            .handle_event(event, core_bounds, core_kb_bounds, resolved_key);
-
-        while let Some(ev) = self.state.pop_session_event() {
-            match ev {
-                SessionEvent::OperatorLogin { operator_id, .. } => {
-                    let op_bytes = operator_id.as_bytes();
-                    let len = op_bytes.len().min(32);
-                    let mut payload = AuthInitPayload {
-                        auth_data_len: len as u8,
-                        auth_data: [0u8; 32],
-                        timestamp_ms: now_ms,
-                    };
-                    payload.auth_data[..len].copy_from_slice(&op_bytes[..len]);
-                    self.net_client.send_auth(&payload).expect("enqueue auth");
-                }
-                SessionEvent::OperatorLogout { operator_id, .. } => {
-                    self.net_client
-                        .send_work_event(&WorkEventPayload::operator_logout(
-                            operator_id.as_bytes(),
-                            now_ms,
-                        ))
-                        .expect("enqueue logout");
-                }
-                SessionEvent::WorkStart {
-                    operator_id,
-                    job_id,
-                    ..
-                } => {
-                    self.net_client
-                        .send_work_event(&WorkEventPayload::work_start(
-                            operator_id.as_bytes(),
-                            job_id.as_bytes(),
-                            now_ms,
-                        ))
-                        .expect("enqueue work_start");
-                }
-                SessionEvent::WorkStop {
-                    operator_id,
-                    job_id,
-                    duration_ms,
-                    ..
-                } => {
-                    self.net_client
-                        .send_work_event(&WorkEventPayload::work_stop(
-                            operator_id.as_bytes(),
-                            job_id.as_bytes(),
-                            now_ms,
-                            duration_ms,
-                        ))
-                        .expect("enqueue work_stop");
-                }
-            }
-        }
-
-        self.state.pending_outbox_count = self.net_client.outbox_pending_count() as u16;
-
+    fn render_if_dirty(&mut self) {
         if self.state.dirty {
-            let mut fb = FrameBuf::new(&mut *self.pixels, 800, 480);
+            let mut fb = FrameBuf::new(&mut *self.pixels, SCREEN_WIDTH as usize, SCREEN_HEIGHT as usize);
             self.renderer
                 .render(&mut fb, &self.state)
                 .expect("dirty render");
@@ -147,26 +79,40 @@ impl SimulatedDevice {
         }
     }
 
-    pub fn step_net(&mut self, now_ms: u64) {
-        let fd = self.net_client.socket_fd();
-        let mut revents = 0i16;
-        if fd >= 0 {
-            let mut events = libc::POLLIN;
-            if self.net_client.wants_write() {
-                events |= libc::POLLOUT;
+    pub fn advance_clock(&mut self, now_ms: u64) {
+        self.state.set_now_ms(now_ms);
+        self.render_if_dirty();
+    }
+
+    pub fn network_status(&self) -> NetworkStatus {
+        self.state.network_status
+    }
+
+
+    pub fn handle_ui_event(&mut self, event: UiEvent, now_ms: u64) {
+        let screen_bounds = Rectangle::new(Point::zero(), Size::new(SCREEN_WIDTH, SCREEN_HEIGHT));
+        let zones = LayoutZones::compute(screen_bounds, self.state.keyboard_visible);
+        self.state.set_now_ms(now_ms);
+        match event {
+            UiEvent::TouchDown { .. } | UiEvent::TouchUp { .. } | UiEvent::TouchMove { .. } => {
+                trillby_ui::dispatch_touch(&mut self.state, &zones, event);
             }
-            let mut pfd = libc::pollfd {
-                fd,
-                events,
-                revents: 0,
-            };
-            let ret = unsafe { libc::poll(&mut pfd, 1, 10) };
-            if ret > 0 {
-                revents = pfd.revents;
+            _ => {
+                let core_kb_bounds = zones.keyboard_area.map(eg_rect_to_core);
+                self.state.handle_event(event, core_kb_bounds, None);
             }
         }
+        while let Some(ev) = self.state.pop_session_event() {
+            self.net_client.send_session_event(&ev, now_ms).expect("enqueue session event");
+        }
 
-        if let Some(status) = self.net_client.poll_step(now_ms, revents) {
+        self.state.pending_outbox_count = self.net_client.outbox_pending_count() as u16;
+
+        self.render_if_dirty();
+    }
+
+    pub fn step_net(&mut self, now_ms: u64) {
+        if let Some(status) = self.net_client.wait_and_step_with(now_ms, 10, |_, _| {}) {
             self.handle_ui_event(UiEvent::NetworkStatusChanged(status), now_ms);
         }
         self.state.pending_outbox_count = self.net_client.outbox_pending_count() as u16;
@@ -179,10 +125,10 @@ pub struct ServerProcess {
 }
 
 impl ServerProcess {
-    pub fn spawn(port: u16) -> Self {
+    pub fn spawn_args(args: &[&str]) -> Self {
         let bin = env!("CARGO_BIN_EXE_trillby-server");
         let mut child = Command::new(bin)
-            .args(["--dev", "--bind", "127.0.0.1", "--port", &port.to_string()])
+            .args(args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -205,40 +151,27 @@ impl ServerProcess {
         }
     }
 
+    pub fn spawn(port: u16) -> Self {
+        let port_str = port.to_string();
+        let bind_ip = std::net::Ipv4Addr::from(LOOPBACK).to_string();
+        Self::spawn_args(&["--dev", "--bind", &bind_ip, "--port", &port_str])
+    }
+
     pub fn spawn_with_registry(port: u16, registry_path: &str) -> Self {
-        let bin = env!("CARGO_BIN_EXE_trillby-server");
-        let mut child = Command::new(bin)
-            .args(["--bind", "127.0.0.1", "--port", &port.to_string(), "--registry", registry_path])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("failed to spawn trillby-server with registry");
-
-        let stdout = child.stdout.take().expect("stdout piped");
-        let lines = Arc::new(Mutex::new(Vec::new()));
-        let lines_clone = Arc::clone(&lines);
-
-        std::thread::spawn(move || {
-            let reader = BufReader::new(stdout);
-            for line in reader.lines().map_while(Result::ok) {
-                lines_clone.lock().unwrap().push(line);
-            }
-        });
-
-        Self {
-            child: Some(child),
-            lines,
-        }
+        let port_str = port.to_string();
+        let bind_ip = std::net::Ipv4Addr::from(LOOPBACK).to_string();
+        Self::spawn_args(&["--bind", &bind_ip, "--port", &port_str, "--registry", registry_path])
     }
 
     pub fn try_wait_for_listen(&self, timeout: Duration) -> Option<u16> {
         let deadline = Instant::now() + timeout;
+        let prefix = format!("LISTEN     addr={}:", std::net::Ipv4Addr::from(LOOPBACK));
         while Instant::now() < deadline {
             {
                 let guard = self.lines.lock().unwrap();
                 for line in guard.iter() {
-                    if let Some(idx) = line.find("LISTEN     addr=127.0.0.1:") {
-                        let rest = &line[idx + "LISTEN     addr=127.0.0.1:".len()..];
+                    if let Some(idx) = line.find(&prefix) {
+                        let rest = &line[idx + prefix.len()..];
                         let port_str = rest.split_whitespace().next().unwrap_or("");
                         if let Ok(p) = port_str.parse::<u16>() {
                             return Some(p);
@@ -252,14 +185,14 @@ impl ServerProcess {
     }
 
     pub fn wait_for_listen(&self) -> u16 {
-        self.try_wait_for_listen(Duration::from_secs(3))
+        self.try_wait_for_listen(LOG_WAIT)
             .unwrap_or_else(|| {
                 let guard = self.lines.lock().unwrap();
                 panic!("timed out waiting for LISTEN line; lines so far: {:?}", *guard)
             })
     }
 
-    pub fn wait_for_line(&self, needle: &str, timeout: Duration) -> String {
+    pub fn wait_for_line_timeout(&self, needle: &str, timeout: Duration) -> String {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
             {
@@ -275,6 +208,10 @@ impl ServerProcess {
             "timed out waiting for line containing {:?}; collected lines: {:#?}",
             needle, *guard
         );
+    }
+
+    pub fn wait_for_line(&self, needle: &str) -> String {
+        self.wait_for_line_timeout(needle, LOG_WAIT)
     }
 
     pub fn kill(&mut self) {
@@ -303,23 +240,80 @@ fn barcode(s: &str) -> UiEvent {
     UiEvent::BarcodeScanned(h)
 }
 
+fn write_registry(content: &str) -> tempfile::NamedTempFile {
+    use std::io::Write;
+    let mut file = tempfile::NamedTempFile::new().expect("create temp registry file");
+    file.write_all(content.as_bytes()).expect("write temp registry content");
+    file.flush().expect("flush temp registry content");
+    file
+}
+
+fn drive_until(
+    device: &mut SimulatedDevice,
+    now_ms: &mut u64,
+    max_steps: usize,
+    cond: impl Fn(&SimulatedDevice) -> bool,
+) -> bool {
+    for _ in 0..max_steps {
+        *now_ms += 20;
+        device.step_net(*now_ms);
+        if cond(device) {
+            return true;
+        }
+    }
+    false
+}
+
+fn drive_with_server_until(
+    device: &mut SimulatedDevice,
+    server: &mut trillby_net::NetServer<4>,
+    now_ms: &mut u64,
+    max_steps: usize,
+    mut on_event: impl FnMut(trillby_net::ServerEvent),
+    cond: impl Fn(&SimulatedDevice) -> bool,
+) -> bool {
+    let device_uuid = device.device_uuid;
+    let psk = device.psk;
+    let resolver = move |id: &[u8; 16]| (*id == device_uuid).then_some(psk);
+    for _ in 0..max_steps {
+        *now_ms += 20;
+        device.step_net(*now_ms);
+        server.step(*now_ms, resolver, &mut on_event);
+        if cond(device) {
+            return true;
+        }
+    }
+    false
+}
+
+fn connect(device: &mut SimulatedDevice, now_ms: &mut u64, max_steps: usize) -> bool {
+    drive_until(device, now_ms, max_steps, |d| {
+        d.network_status() == trillby_core::net_types::NetworkStatus::Online
+    })
+}
+
+fn drain(device: &mut SimulatedDevice, now_ms: &mut u64, max_steps: usize) -> bool {
+    drive_until(device, now_ms, max_steps, |d| {
+        d.net_client.outbox_pending_count() == 0
+    })
+}
+
+fn advance_by(device: &mut SimulatedDevice, now_ms: &mut u64, ms: u64) {
+    *now_ms += ms;
+    device.advance_clock(*now_ms);
+}
+
 #[test]
 fn e2e_server_process_full_operator_lifecycle() {
     let mut server = ServerProcess::spawn(0);
     let port = server.wait_for_listen();
     assert!(port > 0);
 
-    let mut device = SimulatedDevice::new(DEV_PSK, DEV_UUID, [127, 0, 0, 1], port);
+    let mut device = SimulatedDevice::new(DEV_PSK, DEV_UUID, LOOPBACK, port);
     let mut now_ms = 1_000u64;
 
     // Connect to trillby-server
-    for _ in 0..50 {
-        device.step_net(now_ms);
-        if device.net_client.state() == ClientState::Online {
-            break;
-        }
-        now_ms += 20;
-    }
+    assert!(connect(&mut device, &mut now_ms, 50));
     assert_eq!(device.net_client.state(), ClientState::Online);
     assert_eq!(device.state.network_status, NetworkStatus::Online);
 
@@ -341,10 +335,7 @@ fn e2e_server_process_full_operator_lifecycle() {
     assert!(device.state.keyboard_visible);
 
     // 3. Advance 40 ticks (40 * 50ms = 2000ms)
-    for _ in 0..40 {
-        now_ms += 50;
-        device.handle_ui_event(UiEvent::Tick, now_ms);
-    }
+    advance_by(&mut device, &mut now_ms, 40 * 50);
 
     // 4. Barcode scan: Working -> Authenticated (duration_ms = 2000, keyboard auto-hidden)
     device.handle_ui_event(barcode("JOB_5001"), now_ms);
@@ -362,7 +353,7 @@ fn e2e_server_process_full_operator_lifecycle() {
     // 6. Enqueue heartbeat
     device
         .net_client
-        .send_heartbeat(&HeartbeatPayload {
+        .send_payload(&HeartbeatPayload {
             battery_pct: 95,
             rssi: -48,
             pending_outbox: device.net_client.outbox_pending_count() as u16,
@@ -371,53 +362,44 @@ fn e2e_server_process_full_operator_lifecycle() {
         .expect("send_heartbeat");
 
     // Drive network until outbox is completely drained and ACKed
-    for _ in 0..100 {
-        now_ms += 20;
-        device.step_net(now_ms);
-        if device.net_client.outbox_pending_count() == 0 {
-            break;
-        }
-    }
+    assert!(drain(&mut device, &mut now_ms, 100));
     assert_eq!(device.net_client.outbox_pending_count(), 0);
     assert_eq!(device.state.pending_outbox_count, 0);
     assert!(device.render_count > 1);
 
-    let timeout = Duration::from_secs(3);
-    server.wait_for_line("CONNECT    client=0", timeout);
-    let auth_line = server.wait_for_line("AUTH       client=0", timeout);
+    server.wait_for_line("CONNECT    client=0");
+    let auth_line = server.wait_for_line("AUTH       client=0");
     assert!(auth_line.contains("badge=\"BADGE_101\""), "{auth_line}");
 
-    let start_line = server.wait_for_line("WORK_START client=0", timeout);
+    let start_line = server.wait_for_line("WORK_START client=0");
     assert!(
         start_line.contains("operator=\"BADGE_101\" job=\"JOB_5001\""),
         "{start_line}"
     );
 
-    let stop_line = server.wait_for_line("WORK_STOP  client=0", timeout);
+    let stop_line = server.wait_for_line("WORK_STOP  client=0");
     assert!(
         stop_line.contains("operator=\"BADGE_101\" job=\"JOB_5001\" duration_ms=2000"),
         "{stop_line}"
     );
 
-    let logout_line = server.wait_for_line("LOGOUT     client=0", timeout);
+    let logout_line = server.wait_for_line("LOGOUT     client=0");
     assert!(
         logout_line.contains("operator=\"BADGE_101\""),
         "{logout_line}"
     );
 
-    let hb_line = server.wait_for_line("HEARTBEAT  client=0", timeout);
+    let hb_line = server.wait_for_line("HEARTBEAT  client=0");
     assert!(hb_line.contains("battery=95% rssi=-48dBm"), "{hb_line}");
-
     server.kill();
 }
 
 #[test]
 fn e2e_connection_drop_mid_job_and_server_restart_recovery() {
-    let mut server = NetServer::<4>::bind([127, 0, 0, 1], 0).expect("bind NetServer");
+    let mut server = NetServer::<4>::bind(LOOPBACK, 0).expect("bind NetServer");
     let port = server.port();
-    let resolver = |uuid: &[u8; 16]| (*uuid == DEV_UUID).then_some(DEV_PSK);
 
-    let mut device = SimulatedDevice::new(DEV_PSK, DEV_UUID, [127, 0, 0, 1], port);
+    let mut device = SimulatedDevice::new(DEV_PSK, DEV_UUID, LOOPBACK, port);
     let mut now_ms = 1_000u64;
 
     // Connect device and log in OP_77 + start JOB_A
@@ -426,23 +408,22 @@ fn e2e_connection_drop_mid_job_and_server_restart_recovery() {
     now_ms += 50;
 
     let mut initial_events = Vec::new();
-    for _ in 0..50 {
-        now_ms += 20;
-        device.step_net(now_ms);
-        server.step(now_ms, resolver, |ev| {
+    let ok = drive_with_server_until(
+        &mut device,
+        &mut server,
+        &mut now_ms,
+        50,
+        |ev| {
             if let ServerEvent::Data {
                 msg_type, payload, ..
             } = ev
             {
                 initial_events.push((msg_type, payload.to_vec()));
             }
-        });
-        if device.net_client.outbox_pending_count() == 0
-            && device.net_client.state() == ClientState::Online
-        {
-            break;
-        }
-    }
+        },
+        |d| d.net_client.outbox_pending_count() == 0 && d.net_client.state() == ClientState::Online,
+    );
+    assert!(ok);
     assert_eq!(device.net_client.outbox_pending_count(), 0);
     assert_eq!(initial_events.len(), 2);
     assert_eq!(server.client_session_id(0), Some(1000));
@@ -456,13 +437,7 @@ fn e2e_connection_drop_mid_job_and_server_restart_recovery() {
     server.disconnect_client(0);
 
     // Step device so it observes POLLHUP / EOF and transitions to Offline
-    for _ in 0..10 {
-        now_ms += 20;
-        device.step_net(now_ms);
-        if device.state.network_status == NetworkStatus::Offline {
-            break;
-        }
-    }
+    assert!(drive_until(&mut device, &mut now_ms, 10, |d| d.network_status() == NetworkStatus::Offline));
     assert_eq!(device.state.network_status, NetworkStatus::Offline);
     assert!(matches!(
         device.net_client.state(),
@@ -470,18 +445,12 @@ fn e2e_connection_drop_mid_job_and_server_restart_recovery() {
     ));
 
     // While offline: advance 30 ticks (1500ms), stop JOB_A, start JOB_B, advance 20 ticks (1000ms), stop JOB_B, logout OP_77
-    for _ in 0..30 {
-        now_ms += 50;
-        device.handle_ui_event(UiEvent::Tick, now_ms);
-    }
+    advance_by(&mut device, &mut now_ms, 30 * 50);
     device.handle_ui_event(barcode("JOB_A"), now_ms);
 
     now_ms += 50;
     device.handle_ui_event(barcode("JOB_B"), now_ms);
-    for _ in 0..20 {
-        now_ms += 50;
-        device.handle_ui_event(UiEvent::Tick, now_ms);
-    }
+    advance_by(&mut device, &mut now_ms, 20 * 50);
     device.handle_ui_event(barcode("JOB_B"), now_ms);
 
     now_ms += 50;
@@ -495,10 +464,12 @@ fn e2e_connection_drop_mid_job_and_server_restart_recovery() {
     let mut recovered_work_events = Vec::new();
     let mut reconnected_session_id = None;
 
-    for _ in 0..80 {
-        now_ms += 20;
-        device.step_net(now_ms);
-        server.step(now_ms, resolver, |ev| match ev {
+    let ok = drive_with_server_until(
+        &mut device,
+        &mut server,
+        &mut now_ms,
+        80,
+        |ev| match ev {
             ServerEvent::Connected { session_id, .. } => {
                 reconnected_session_id = Some(session_id);
             }
@@ -511,13 +482,10 @@ fn e2e_connection_drop_mid_job_and_server_restart_recovery() {
                 recovered_work_events.push(w);
             }
             _ => {}
-        });
-        if device.net_client.outbox_pending_count() == 0
-            && device.net_client.state() == ClientState::Online
-        {
-            break;
-        }
-    }
+        },
+        |d| d.net_client.outbox_pending_count() == 0 && d.net_client.state() == ClientState::Online,
+    );
+    assert!(ok);
 
     assert_eq!(reconnected_session_id, Some(1001));
     assert_eq!(device.net_client.outbox_pending_count(), 0);
@@ -527,30 +495,18 @@ fn e2e_connection_drop_mid_job_and_server_restart_recovery() {
     // Verify all 4 offline-queued events arrived in exact FIFO order
     assert_eq!(recovered_work_events.len(), 4);
     assert_eq!(recovered_work_events[0].kind, WorkEventKind::WorkStop);
-    assert_eq!(
-        &recovered_work_events[0].job_id[..recovered_work_events[0].job_id_len as usize],
-        b"JOB_A"
-    );
-    assert_eq!(recovered_work_events[0].duration_ms, 1500);
+    assert_eq!(recovered_work_events[0].job_id_bytes(), b"JOB_A");
+    assert_eq!(recovered_work_events[0].duration_ms, 1620);
 
     assert_eq!(recovered_work_events[1].kind, WorkEventKind::WorkStart);
-    assert_eq!(
-        &recovered_work_events[1].job_id[..recovered_work_events[1].job_id_len as usize],
-        b"JOB_B"
-    );
+    assert_eq!(recovered_work_events[1].job_id_bytes(), b"JOB_B");
 
     assert_eq!(recovered_work_events[2].kind, WorkEventKind::WorkStop);
-    assert_eq!(
-        &recovered_work_events[2].job_id[..recovered_work_events[2].job_id_len as usize],
-        b"JOB_B"
-    );
+    assert_eq!(recovered_work_events[2].job_id_bytes(), b"JOB_B");
     assert_eq!(recovered_work_events[2].duration_ms, 1000);
 
     assert_eq!(recovered_work_events[3].kind, WorkEventKind::OperatorLogout);
-    assert_eq!(
-        &recovered_work_events[3].operator_id[..recovered_work_events[3].operator_id_len as usize],
-        b"OP_77"
-    );
+    assert_eq!(recovered_work_events[3].operator_id_bytes(), b"OP_77");
 }
 
 #[test]
@@ -558,11 +514,11 @@ fn e2e_device_offline_boot_queues_events_before_server_starts() {
     for attempt in 0..3 {
         // Reserve a free localhost port and drop the listener so nothing is listening yet
         let port = {
-            let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+            let listener = TcpListener::bind((std::net::Ipv4Addr::from(LOOPBACK), 0)).expect("bind ephemeral port");
             listener.local_addr().unwrap().port()
         };
 
-        let mut device = SimulatedDevice::new(DEV_PSK, DEV_UUID, [127, 0, 0, 1], port);
+        let mut device = SimulatedDevice::new(DEV_PSK, DEV_UUID, LOOPBACK, port);
         let mut now_ms = 1_000u64;
 
         // Attempt initial connection while server is not running (ECONNREFUSED)
@@ -587,10 +543,7 @@ fn e2e_device_offline_boot_queues_events_before_server_starts() {
         device.handle_ui_event(rfid("OP_BOOT"), now_ms);
         now_ms += 50;
         device.handle_ui_event(barcode("JOB_BOOT"), now_ms);
-        for _ in 0..10 {
-            now_ms += 50;
-            device.handle_ui_event(UiEvent::Tick, now_ms);
-        }
+        advance_by(&mut device, &mut now_ms, 10 * 50);
         device.handle_ui_event(barcode("JOB_BOOT"), now_ms);
 
         assert_eq!(device.state.pending_outbox_count, 3);
@@ -609,29 +562,22 @@ fn e2e_device_offline_boot_queues_events_before_server_starts() {
 
         // Advance time past reconnect backoff and drive net loop until drained
         now_ms += 4_000;
-        for _ in 0..100 {
-            now_ms += 20;
-            device.step_net(now_ms);
-            if device.net_client.outbox_pending_count() == 0 {
-                break;
-            }
-        }
+        assert!(drain(&mut device, &mut now_ms, 100));
 
         assert_eq!(device.net_client.outbox_pending_count(), 0);
         assert_eq!(device.state.pending_outbox_count, 0);
         assert_eq!(device.state.network_status, NetworkStatus::Online);
 
-        let timeout = Duration::from_secs(3);
-        let auth_line = server.wait_for_line("AUTH       client=0", timeout);
+        let auth_line = server.wait_for_line("AUTH       client=0");
         assert!(auth_line.contains("badge=\"OP_BOOT\""), "{auth_line}");
 
-        let start_line = server.wait_for_line("WORK_START client=0", timeout);
+        let start_line = server.wait_for_line("WORK_START client=0");
         assert!(
             start_line.contains("operator=\"OP_BOOT\" job=\"JOB_BOOT\""),
             "{start_line}"
         );
 
-        let stop_line = server.wait_for_line("WORK_STOP  client=0", timeout);
+        let stop_line = server.wait_for_line("WORK_STOP  client=0");
         assert!(
             stop_line.contains("operator=\"OP_BOOT\" job=\"JOB_BOOT\" duration_ms=500"),
             "{stop_line}"
@@ -644,25 +590,23 @@ fn e2e_device_offline_boot_queues_events_before_server_starts() {
 
 #[test]
 fn e2e_half_open_ack_timeout_triggers_reconnect_and_retains_event() {
-    let mut server = NetServer::<4>::bind([127, 0, 0, 1], 0).expect("bind NetServer");
+    let mut server = NetServer::<4>::bind(LOOPBACK, 0).expect("bind NetServer");
     let port = server.port();
-    let resolver = |uuid: &[u8; 16]| (*uuid == DEV_UUID).then_some(DEV_PSK);
 
-    let mut device = SimulatedDevice::new(DEV_PSK, DEV_UUID, [127, 0, 0, 1], port);
+    let mut device = SimulatedDevice::new(DEV_PSK, DEV_UUID, LOOPBACK, port);
     let mut now_ms = 1_000u64;
 
     // Establish initial session (session_id == 1000) and deliver RfidScanned("OP_TIMEOUT")
     device.handle_ui_event(rfid("OP_TIMEOUT"), now_ms);
-    for _ in 0..50 {
-        now_ms += 20;
-        device.step_net(now_ms);
-        server.step(now_ms, resolver, |_| {});
-        if device.net_client.outbox_pending_count() == 0
-            && device.net_client.state() == ClientState::Online
-        {
-            break;
-        }
-    }
+    let ok = drive_with_server_until(
+        &mut device,
+        &mut server,
+        &mut now_ms,
+        50,
+        |_| {},
+        |d| d.net_client.outbox_pending_count() == 0 && d.net_client.state() == ClientState::Online,
+    );
+    assert!(ok);
     assert_eq!(device.net_client.state(), ClientState::Online);
     assert_eq!(device.net_client.outbox_pending_count(), 0);
     assert_eq!(server.client_session_id(0), Some(1000));
@@ -702,10 +646,12 @@ fn e2e_half_open_ack_timeout_triggers_reconnect_and_retains_event() {
     let mut new_session_id = None;
     let mut delivered_work = Vec::new();
 
-    for _ in 0..50 {
-        now_ms += 20;
-        device.step_net(now_ms);
-        server.step(now_ms, resolver, |ev| match ev {
+    let ok = drive_with_server_until(
+        &mut device,
+        &mut server,
+        &mut now_ms,
+        50,
+        |ev| match ev {
             ServerEvent::Connected { session_id, .. } => {
                 new_session_id = Some(session_id);
             }
@@ -718,13 +664,10 @@ fn e2e_half_open_ack_timeout_triggers_reconnect_and_retains_event() {
                 delivered_work.push(w);
             }
             _ => {}
-        });
-        if device.net_client.outbox_pending_count() == 0
-            && device.net_client.state() == ClientState::Online
-        {
-            break;
-        }
-    }
+        },
+        |d| d.net_client.outbox_pending_count() == 0 && d.net_client.state() == ClientState::Online,
+    );
+    assert!(ok);
 
     assert_eq!(new_session_id, Some(1001));
     assert_eq!(device.net_client.outbox_pending_count(), 0);
@@ -732,28 +675,12 @@ fn e2e_half_open_ack_timeout_triggers_reconnect_and_retains_event() {
     assert_eq!(device.state.network_status, NetworkStatus::Online);
     assert_eq!(delivered_work.len(), 1);
     assert_eq!(delivered_work[0].kind, WorkEventKind::WorkStart);
-    assert_eq!(
-        &delivered_work[0].operator_id[..delivered_work[0].operator_id_len as usize],
-        b"OP_TIMEOUT"
-    );
-    assert_eq!(
-        &delivered_work[0].job_id[..delivered_work[0].job_id_len as usize],
-        b"JOB_TIMEOUT"
-    );
+    assert_eq!(delivered_work[0].operator_id_bytes(), b"OP_TIMEOUT");
+    assert_eq!(delivered_work[0].job_id_bytes(), b"JOB_TIMEOUT");
 }
 
 #[test]
 fn e2e_registry_multi_client_isolation_and_unauthorized_device_rejection() {
-    let pid = std::process::id();
-    let reg_path = format!("/tmp/trillby_test_reg_multi_{}.tsv", pid);
-    struct TempFile(String);
-    impl Drop for TempFile {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
-    }
-    let _guard = TempFile(reg_path.clone());
-
     let dev1_uuid = *b"DEV_0001_UUID\0\0\0";
     let dev1_psk = [0x11u8; 32];
     let dev2_uuid = *b"DEV_0002_UUID\0\0\0";
@@ -762,34 +689,26 @@ fn e2e_registry_multi_client_isolation_and_unauthorized_device_rejection() {
     let bad_psk = [0x99u8; 32];
 
     let mut dev1_uuid_hex = String::new();
-    for b in &dev1_uuid {
-        dev1_uuid_hex.push_str(&format!("{b:02x}"));
-    }
+    let _ = trillby_net::write_hex(&mut dev1_uuid_hex, &dev1_uuid);
     let mut dev1_psk_hex = String::new();
-    for b in &dev1_psk {
-        dev1_psk_hex.push_str(&format!("{b:02x}"));
-    }
+    let _ = trillby_net::write_hex(&mut dev1_psk_hex, &dev1_psk);
     let mut dev2_uuid_hex = String::new();
-    for b in &dev2_uuid {
-        dev2_uuid_hex.push_str(&format!("{b:02x}"));
-    }
+    let _ = trillby_net::write_hex(&mut dev2_uuid_hex, &dev2_uuid);
     let mut dev2_psk_hex = String::new();
-    for b in &dev2_psk {
-        dev2_psk_hex.push_str(&format!("{b:02x}"));
-    }
+    let _ = trillby_net::write_hex(&mut dev2_psk_hex, &dev2_psk);
 
     let reg_content = format!(
         "{dev1_uuid_hex}\t{dev1_psk_hex}\n\
          {dev2_uuid_hex}\t{dev2_psk_hex}\n"
     );
-    std::fs::write(&reg_path, reg_content).expect("write registry");
+    let reg_file = write_registry(&reg_content);
 
-    let server = ServerProcess::spawn_with_registry(0, &reg_path);
+    let server = ServerProcess::spawn_with_registry(0, reg_file.path().to_str().unwrap());
     let port = server.wait_for_listen();
 
-    let mut dev1 = SimulatedDevice::new(dev1_psk, dev1_uuid, [127, 0, 0, 1], port);
-    let mut dev2 = SimulatedDevice::new(dev2_psk, dev2_uuid, [127, 0, 0, 1], port);
-    let mut dev_bad = SimulatedDevice::new(bad_psk, bad_uuid, [127, 0, 0, 1], port);
+    let mut dev1 = SimulatedDevice::new(dev1_psk, dev1_uuid, LOOPBACK, port);
+    let mut dev2 = SimulatedDevice::new(dev2_psk, dev2_uuid, LOOPBACK, port);
+    let mut dev_bad = SimulatedDevice::new(bad_psk, bad_uuid, LOOPBACK, port);
 
     let mut now_ms = 1_000u64;
     for _ in 0..60 {
@@ -818,8 +737,8 @@ fn e2e_registry_multi_client_isolation_and_unauthorized_device_rejection() {
 
     for _ in 0..10 {
         now_ms += 50;
-        dev1.handle_ui_event(UiEvent::Tick, now_ms);
-        dev2.handle_ui_event(UiEvent::Tick, now_ms);
+        dev1.advance_clock(now_ms);
+        dev2.advance_clock(now_ms);
         dev1.step_net(now_ms);
         dev2.step_net(now_ms);
         dev_bad.step_net(now_ms);
@@ -843,16 +762,15 @@ fn e2e_registry_multi_client_isolation_and_unauthorized_device_rejection() {
     assert_eq!(dev1.net_client.outbox_pending_count(), 0);
     assert_eq!(dev2.net_client.outbox_pending_count(), 0);
 
-    let dev1_conn = server.wait_for_line(&format!("uuid={dev1_uuid_hex}"), Duration::from_secs(3));
-    let dev2_conn = server.wait_for_line(&format!("uuid={dev2_uuid_hex}"), Duration::from_secs(3));
+    let dev1_conn = server.wait_for_line(&format!("uuid={dev1_uuid_hex}"));
+    let dev2_conn = server.wait_for_line(&format!("uuid={dev2_uuid_hex}"));
     assert!(dev1_conn.contains("CONNECT"));
     assert!(dev2_conn.contains("CONNECT"));
 
-    let dev1_work = server.wait_for_line("operator=\"OP_1\" job=\"JOB_A\"", Duration::from_secs(3));
-    let dev2_work = server.wait_for_line("operator=\"OP_2\" job=\"JOB_B\"", Duration::from_secs(3));
+    let dev1_work = server.wait_for_line("operator=\"OP_1\" job=\"JOB_A\"");
+    let dev2_work = server.wait_for_line("operator=\"OP_2\" job=\"JOB_B\"");
     assert!(dev1_work.contains("WORK_START"));
     assert!(dev2_work.contains("WORK_START"));
-
     let lines = server.lines.lock().unwrap();
     let has_bad_disconnect = lines.iter().any(|l| l.contains("DISCONNECT") && !l.contains("uuid="));
     assert!(has_bad_disconnect, "server must log DISCONNECT without uuid for unauthorized device; lines: {:#?}", *lines);
@@ -862,16 +780,10 @@ fn e2e_registry_multi_client_isolation_and_unauthorized_device_rejection() {
 fn e2e_operator_rfid_hot_swap_mid_job_and_barcode_rejection() {
     let server = ServerProcess::spawn(0);
     let port = server.wait_for_listen();
-    let mut device = SimulatedDevice::new(DEV_PSK, DEV_UUID, [127, 0, 0, 1], port);
+    let mut device = SimulatedDevice::new(DEV_PSK, DEV_UUID, LOOPBACK, port);
     let mut now_ms = 1_000u64;
 
-    for _ in 0..50 {
-        now_ms += 20;
-        device.step_net(now_ms);
-        if device.net_client.state() == ClientState::Online {
-            break;
-        }
-    }
+    assert!(connect(&mut device, &mut now_ms, 50));
     assert_eq!(device.net_client.state(), ClientState::Online);
 
     device.handle_ui_event(barcode("JOB_EARLY"), now_ms);
@@ -892,19 +804,10 @@ fn e2e_operator_rfid_hot_swap_mid_job_and_barcode_rejection() {
         SessionState::Working { .. }
     ));
 
-    for _ in 0..50 {
-        now_ms += 20;
-        device.step_net(now_ms);
-        if device.net_client.outbox_pending_count() == 0 {
-            break;
-        }
-    }
+    assert!(drain(&mut device, &mut now_ms, 50));
     assert_eq!(device.net_client.outbox_pending_count(), 0);
 
-    for _ in 0..20 {
-        now_ms += 50;
-        device.handle_ui_event(UiEvent::Tick, now_ms);
-    }
+    advance_by(&mut device, &mut now_ms, 20 * 50);
 
     device.handle_ui_event(barcode("JOB_9999"), now_ms);
     match device.state.session_state() {
@@ -923,32 +826,23 @@ fn e2e_operator_rfid_hot_swap_mid_job_and_barcode_rejection() {
         other => panic!("expected Authenticated(BADGE_202), got: {:?}", other),
     }
 
-    for _ in 0..100 {
-        now_ms += 20;
-        device.step_net(now_ms);
-        if device.net_client.outbox_pending_count() == 0 {
-            break;
-        }
-    }
+    assert!(drain(&mut device, &mut now_ms, 100));
     assert_eq!(device.net_client.outbox_pending_count(), 0);
 
     server.wait_for_line(
-        "WORK_STOP  client=0 operator=\"BADGE_101\" job=\"JOB_5001\" duration_ms=1000",
-        Duration::from_secs(3),
+        "WORK_STOP  client=0 operator=\"BADGE_101\" job=\"JOB_5001\" duration_ms=1060",
     );
     server.wait_for_line(
         "LOGOUT     client=0 operator=\"BADGE_101\"",
-        Duration::from_secs(3),
     );
     server.wait_for_line(
         "AUTH       client=0 badge=\"BADGE_202\"",
-        Duration::from_secs(3),
     );
 
     let guard = server.lines.lock().unwrap();
     let stop_idx = guard
         .iter()
-        .position(|l| l.contains("WORK_STOP") && l.contains("BADGE_101") && l.contains("duration_ms=1000"))
+        .position(|l| l.contains("WORK_STOP") && l.contains("BADGE_101") && l.contains("duration_ms=1060"))
         .expect("WORK_STOP line found");
     let logout_idx = guard
         .iter()
@@ -968,37 +862,22 @@ fn e2e_true_server_process_kill_and_restart_recovery() {
     let port = server1.wait_for_listen();
     assert!(port > 0);
 
-    let mut device = SimulatedDevice::new(DEV_PSK, DEV_UUID, [127, 0, 0, 1], port);
+    let mut device = SimulatedDevice::new(DEV_PSK, DEV_UUID, LOOPBACK, port);
     let mut now_ms = 1_000u64;
 
-    for _ in 0..50 {
-        now_ms += 20;
-        device.step_net(now_ms);
-        if device.net_client.state() == ClientState::Online {
-            break;
-        }
-    }
+    assert!(connect(&mut device, &mut now_ms, 50));
     assert_eq!(device.net_client.state(), ClientState::Online);
 
     device.handle_ui_event(rfid("OP_RESTART"), now_ms);
     now_ms += 50;
     device.handle_ui_event(barcode("JOB_R1"), now_ms);
 
-    for _ in 0..50 {
-        now_ms += 20;
-        device.step_net(now_ms);
-        if device.net_client.outbox_pending_count() == 0 {
-            break;
-        }
-    }
+    assert!(drain(&mut device, &mut now_ms, 50));
     assert_eq!(device.net_client.outbox_pending_count(), 0);
 
     server1.kill();
 
-    for _ in 0..30 {
-        now_ms += 50;
-        device.handle_ui_event(UiEvent::Tick, now_ms);
-    }
+    advance_by(&mut device, &mut now_ms, 30 * 50);
 
     device.handle_ui_event(barcode("JOB_R1"), now_ms);
     assert_eq!(device.net_client.outbox_pending_count(), 1);
@@ -1012,28 +891,23 @@ fn e2e_true_server_process_kill_and_restart_recovery() {
             server2 = Some(s);
             break;
         }
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(50));
     }
     let server2 = server2.expect("server #2 spawned on same port");
 
     now_ms += 5_000;
 
-    for _ in 0..100 {
-        now_ms += 20;
-        device.step_net(now_ms);
-        if device.net_client.state() == ClientState::Online
-            && device.net_client.outbox_pending_count() == 0
-        {
-            break;
-        }
-    }
+    let ok = drive_until(&mut device, &mut now_ms, 100, |d| {
+        d.net_client.state() == ClientState::Online
+            && d.net_client.outbox_pending_count() == 0
+    });
+    assert!(ok);
 
     assert_eq!(device.net_client.state(), ClientState::Online);
     assert_eq!(device.net_client.outbox_pending_count(), 0);
 
-    server2.wait_for_line("CONNECT", Duration::from_secs(3));
+    server2.wait_for_line("CONNECT");
     server2.wait_for_line(
-        "WORK_STOP  client=0 operator=\"OP_RESTART\" job=\"JOB_R1\" duration_ms=1500",
-        Duration::from_secs(3),
+        "WORK_STOP  client=0 operator=\"OP_RESTART\" job=\"JOB_R1\" duration_ms=1560",
     );
 }

@@ -1,23 +1,18 @@
 [package]
 name = "trillby"
-version = "0.1.0"
-edition = "2021"
-authors = ["Trillby Team"]
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
 description = "Handheld Production Floor Scanner Client"
 
 [dependencies]
-trillby-core = { path = "../trillby-core" }
-trillby-ui = { path = "../trillby-ui" }
-trillby-net = { path = "../trillby-net" }
-embedded-graphics = "0.8"
-embedded-graphics-framebuf = "0.3"
-heapless = "0.8"
-libc = "0.2"
-
-[[bin]]
-name = "trillby"
-path = "src/main.rs"
+trillby-core = { workspace = true }
+trillby-ui = { workspace = true }
+trillby-net = { workspace = true }
+embedded-graphics = { workspace = true }
+embedded-graphics-framebuf = { workspace = true }
+heapless = { workspace = true }
+libc = { workspace = true }
 
 [features]
-default = []
 qemu-sim = []

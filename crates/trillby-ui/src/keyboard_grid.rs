@@ -97,15 +97,15 @@ const fn layout_is_valid(layout: &Layout) -> bool {
 const _: () = assert!(layout_is_valid(&ALPHA), "ALPHA: a row does not span COLS units");
 const _: () = assert!(layout_is_valid(&SYMBOLS), "SYMBOLS: a row does not span COLS units");
 
+fn binding(index: u8) -> Option<Binding> {
+    SPECIAL_BINDINGS.get(index as usize).copied().flatten()
+}
+
 impl Slot {
     /// The key a tap on this slot produces (`Special` resolved via bindings).
     pub fn resolved(self) -> Option<Key> {
         match self.key {
-            Key::Special(i) => SPECIAL_BINDINGS
-                .get(i as usize)
-                .copied()
-                .flatten()
-                .map(|b| b.key),
+            Key::Special(i) => binding(i).map(|b| b.key),
             key => Some(key),
         }
     }
@@ -121,11 +121,7 @@ impl Slot {
                 KeyboardLayer::Alpha => "?123",
                 KeyboardLayer::Symbols => "ABC",
             },
-            Key::Special(i) => SPECIAL_BINDINGS
-                .get(i as usize)
-                .copied()
-                .flatten()
-                .map_or("", |b| b.label),
+            Key::Special(i) => binding(i).map_or("", |b| b.label),
         }
     }
 }
@@ -133,9 +129,6 @@ impl Slot {
 pub struct KeyboardGrid;
 
 impl KeyboardGrid {
-    pub const ROWS: usize = ROWS;
-    pub const COLS: usize = COLS;
-
     pub const fn layout(layer: KeyboardLayer) -> &'static Layout {
         match layer {
             KeyboardLayer::Alpha => &ALPHA,
@@ -209,7 +202,7 @@ mod tests {
 
     #[test]
     fn unbound_special_slots_are_inert() {
-        for layer in [KeyboardLayer::Alpha, KeyboardLayer::Symbols] {
+        for layer in KeyboardLayer::ALL {
             for (cell, slot) in KeyboardGrid::slots(KB, layer) {
                 if let Key::Special(i) = slot.key {
                     let mut buf = [0; 4];
@@ -223,7 +216,7 @@ mod tests {
 
     #[test]
     fn special_indices_are_in_range() {
-        for layer in [KeyboardLayer::Alpha, KeyboardLayer::Symbols] {
+        for layer in KeyboardLayer::ALL {
             for (_, slot) in KeyboardGrid::slots(KB, layer) {
                 if let Key::Special(i) = slot.key {
                     assert!((i as usize) < SPECIAL_BINDINGS.len());
@@ -236,7 +229,7 @@ mod tests {
     /// and that cells tile the keyboard exactly.
     #[test]
     fn cells_round_trip_and_tile() {
-        for layer in [KeyboardLayer::Alpha, KeyboardLayer::Symbols] {
+        for layer in KeyboardLayer::ALL {
             let mut area = 0u32;
             for (cell, slot) in KeyboardGrid::slots(KB, layer) {
                 assert_eq!(KeyboardGrid::slot_at(KB, cell.center(), layer), Some(slot));
@@ -248,7 +241,7 @@ mod tests {
 
     #[test]
     fn all_alpha_and_symbols_slots_resolve_at_edges_and_labels_match() {
-        for layer in [KeyboardLayer::Alpha, KeyboardLayer::Symbols] {
+        for layer in KeyboardLayer::ALL {
             for (rect, slot) in KeyboardGrid::slots(KB, layer) {
                 let mut buf = [0u8; 4];
                 let label = slot.label(layer, &mut buf);
@@ -287,7 +280,7 @@ mod tests {
     #[test]
     fn cells_tile_disjointly_without_gaps_on_non_divisible_bounds() {
         let bounds = Rectangle::new(Point::new(3, 7), Size::new(799, 179));
-        for layer in [KeyboardLayer::Alpha, KeyboardLayer::Symbols] {
+        for layer in KeyboardLayer::ALL {
             let mut total_area = 0u32;
             let mut prev_row_bottom_y = bounds.top_left.y;
             let mut row_height_sum = 0u32;

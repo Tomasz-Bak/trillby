@@ -23,14 +23,14 @@ pub enum OutboxError {
 }
 
 #[derive(Clone, Copy)]
-pub struct QueuedEvent {
-    pub msg_type: MsgType,
-    pub len: u8,
-    pub data: [u8; MAX_EVENT_LEN],
+struct QueuedEvent {
+    msg_type: MsgType,
+    len: u8,
+    data: [u8; MAX_EVENT_LEN],
 }
 
 impl QueuedEvent {
-    pub const fn empty() -> Self {
+    const fn empty() -> Self {
         Self {
             msg_type: MsgType::Data,
             len: 0,

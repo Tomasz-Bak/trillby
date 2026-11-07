@@ -21,18 +21,15 @@ const K256: [u32; 64] = [
     0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
 ];
 
-#[derive(Clone, Copy)]
-pub struct Sha256 {
-    state: [u32; 8],
-    buffer: [u8; 64],
-    buf_len: usize,
-    total_len: u64,
-}
+pub(crate) const BLOCK_LEN: usize = 64;
+pub const DIGEST_LEN: usize = 32;
+const LEN_OFFSET: usize = BLOCK_LEN - 8;
 
-impl Default for Sha256 {
-    fn default() -> Self {
-        Self::new()
-    }
+#[derive(Clone, Copy)]
+pub(crate) struct Sha256 {
+    state: [u32; 8],
+    buffer: super::BlockBuffer<BLOCK_LEN>,
+    total_len: u64,
 }
 
 impl Sha256 {
@@ -42,53 +39,30 @@ impl Sha256 {
                 0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
                 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
             ],
-            buffer: [0u8; 64],
-            buf_len: 0,
+            buffer: super::BlockBuffer::new(),
             total_len: 0,
         }
     }
 
-    pub fn update(&mut self, mut data: &[u8]) {
+    pub fn update(&mut self, data: &[u8]) {
         self.total_len = self.total_len.wrapping_add(data.len() as u64);
-
-        if self.buf_len > 0 {
-            let needed = 64 - self.buf_len;
-            if data.len() < needed {
-                self.buffer[self.buf_len..self.buf_len + data.len()].copy_from_slice(data);
-                self.buf_len += data.len();
-                return;
-            }
-            self.buffer[self.buf_len..].copy_from_slice(&data[..needed]);
-            Self::process_block(&mut self.state, &self.buffer);
-            self.buf_len = 0;
-            data = &data[needed..];
-        }
-
-        // Full blocks straight from the input, no staging copy.
-        let mut blocks = data.chunks_exact(64);
-        for block in &mut blocks {
-            Self::process_block(&mut self.state, block.try_into().unwrap());
-        }
-
-        let rem = blocks.remainder();
-        self.buffer[..rem.len()].copy_from_slice(rem);
-        self.buf_len = rem.len();
+        self.buffer.absorb(data, |b| Self::process_block(&mut self.state, b));
     }
 
-    pub fn finalize(mut self) -> [u8; 32] {
+    pub fn finalize(mut self) -> [u8; DIGEST_LEN] {
         let bit_len = self.total_len.wrapping_mul(8);
-        self.buffer[self.buf_len] = 0x80;
-        self.buffer[self.buf_len + 1..].fill(0);
+        self.buffer.buf[self.buffer.len] = 0x80;
+        self.buffer.buf[self.buffer.len + 1..].fill(0);
 
-        if self.buf_len >= 56 {
-            Self::process_block(&mut self.state, &self.buffer);
-            self.buffer.fill(0);
+        if self.buffer.len >= LEN_OFFSET {
+            Self::process_block(&mut self.state, &self.buffer.buf);
+            self.buffer.buf.fill(0);
         }
 
-        self.buffer[56..].copy_from_slice(&bit_len.to_be_bytes());
-        Self::process_block(&mut self.state, &self.buffer);
+        self.buffer.buf[LEN_OFFSET..].copy_from_slice(&bit_len.to_be_bytes());
+        Self::process_block(&mut self.state, &self.buffer.buf);
 
-        let mut out = [0u8; 32];
+        let mut out = [0u8; DIGEST_LEN];
         for (dst, &s) in out.chunks_exact_mut(4).zip(self.state.iter()) {
             dst.copy_from_slice(&s.to_be_bytes());
         }
@@ -99,10 +73,10 @@ impl Sha256 {
     /// Clears key-dependent state (e.g. HMAC pads absorbed into it).
     pub(crate) fn wipe(&mut self) {
         wipe(&mut self.state);
-        wipe(&mut self.buffer);
+        self.buffer.wipe();
     }
 
-    fn process_block(state: &mut [u32; 8], block: &[u8; 64]) {
+    fn process_block(state: &mut [u32; 8], block: &[u8; BLOCK_LEN]) {
         // Rolling 16-word message schedule instead of a 256-byte w[64].
         let mut w = [0u32; 16];
         for (wi, b) in w.iter_mut().zip(block.chunks_exact(4)) {
@@ -150,7 +124,7 @@ impl Sha256 {
     }
 }
 
-pub fn sha256(data: &[u8]) -> [u8; 32] {
+pub fn sha256(data: &[u8]) -> [u8; DIGEST_LEN] {
     let mut hasher = Sha256::new();
     hasher.update(data);
     hasher.finalize()
@@ -161,34 +135,37 @@ mod tests {
     use super::*;
     use crate::crypto::hex;
 
+    fn assert_sha256(input: &[u8], expected: [u8; 32]) {
+        assert_eq!(sha256(input), expected);
+        let mut s = Sha256::new();
+        for &b in input {
+            s.update(&[b]);
+        }
+        assert_eq!(s.finalize(), expected);
+    }
+
     #[test]
     fn test_sha256_vector() {
-        let hash = sha256(b"abc");
         assert_eq!(
-            hash,
-            [
-                0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea,
-                0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22, 0x23,
-                0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c,
-                0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad
-            ]
+            sha256(b"abc"),
+            hex::<32>("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
         );
     }
 
     #[test]
     fn test_sha256_empty() {
-        assert_eq!(
-            sha256(b""),
-            hex::<32>("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+        assert_sha256(
+            b"",
+            hex::<32>("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
         );
     }
 
     #[test]
     fn test_sha256_two_block_padding() {
         // 56-byte message: padding spills into a second block.
-        assert_eq!(
-            sha256(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
-            hex::<32>("248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1")
+        assert_sha256(
+            b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq",
+            hex::<32>("248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"),
         );
     }
 
@@ -214,23 +191,11 @@ mod tests {
         // 55-byte input: 55 data bytes + 1 byte delimiter 0x80 + 8 bytes length = 64 bytes (exact single block)
         let input_55 = [b'A'; 55];
         let expected_55 = hex::<32>("8963cc0afd622cc7574ac2011f93a3059b3d65548a77542a1559e3d202e6ab00");
-        assert_eq!(sha256(&input_55), expected_55);
-
-        let mut streaming_55 = Sha256::new();
-        for &b in &input_55 {
-            streaming_55.update(&[b]);
-        }
-        assert_eq!(streaming_55.finalize(), expected_55);
+        assert_sha256(&input_55, expected_55);
 
         // 64-byte input: exactly fills the first block, spilling padding into a second block
         let input_64 = [b'A'; 64];
         let expected_64 = hex::<32>("d53eda7a637c99cc7fb566d96e9fa109bf15c478410a3f5eb4d4c4e26cd081f6");
-        assert_eq!(sha256(&input_64), expected_64);
-
-        let mut streaming_64 = Sha256::new();
-        for &b in &input_64 {
-            streaming_64.update(&[b]);
-        }
-        assert_eq!(streaming_64.finalize(), expected_64);
+        assert_sha256(&input_64, expected_64);
     }
 }

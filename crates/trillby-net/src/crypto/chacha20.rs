@@ -1,6 +1,11 @@
 //! ChaCha20 stream cipher (RFC 8439).
 
-use super::wipe;
+use super::{wipe, CryptoError};
+
+pub const KEY_LEN: usize = 32;
+pub const NONCE_LEN: usize = 12;
+pub(crate) const BLOCK_LEN: usize = 64;
+const COUNTER_WORD: usize = 12;
 
 #[inline(always)]
 fn chacha_quarter_round(state: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize) {
@@ -26,20 +31,20 @@ fn le32(b: &[u8]) -> u32 {
     u32::from_le_bytes([b[0], b[1], b[2], b[3]])
 }
 
-fn init_state(key: &[u8; 32], nonce: &[u8; 12], counter: u32) -> [u32; 16] {
+fn init_state(key: &[u8; KEY_LEN], nonce: &[u8; NONCE_LEN], counter: u32) -> [u32; 16] {
     let mut s = [0u32; 16];
     s[..4].copy_from_slice(&[0x61707865, 0x3320646e, 0x79622d32, 0x6b206574]);
     for (dst, src) in s[4..12].iter_mut().zip(key.chunks_exact(4)) {
         *dst = le32(src);
     }
-    s[12] = counter;
+    s[COUNTER_WORD] = counter;
     for (dst, src) in s[13..16].iter_mut().zip(nonce.chunks_exact(4)) {
         *dst = le32(src);
     }
     s
 }
 
-fn block_from_state(state: &[u32; 16], out: &mut [u8; 64]) {
+fn block_from_state(state: &[u32; 16], out: &mut [u8; BLOCK_LEN]) {
     let mut working = *state;
 
     for _ in 0..10 {
@@ -62,7 +67,7 @@ fn block_from_state(state: &[u32; 16], out: &mut [u8; 64]) {
     wipe(&mut working);
 }
 
-pub fn chacha20_block(key: &[u8; 32], nonce: &[u8; 12], counter: u32, out: &mut [u8; 64]) {
+pub(crate) fn chacha20_block(key: &[u8; KEY_LEN], nonce: &[u8; NONCE_LEN], counter: u32, out: &mut [u8; BLOCK_LEN]) {
     let mut state = init_state(key, nonce, counter);
     block_from_state(&state, out);
     wipe(&mut state);
@@ -72,22 +77,22 @@ pub fn chacha20_block(key: &[u8; 32], nonce: &[u8; 12], counter: u32, out: &mut 
 ///
 /// Fails without touching `buf` if the 32-bit block counter would wrap,
 /// since wrapping reuses keystream (catastrophic for a stream cipher).
-pub fn chacha20_xor(key: &[u8; 32], nonce: &[u8; 12], counter: u32, buf: &mut [u8]) -> Result<(), ()> {
-    let blocks = (buf.len() as u64).div_ceil(64);
+pub(crate) fn chacha20_xor(key: &[u8; KEY_LEN], nonce: &[u8; NONCE_LEN], counter: u32, buf: &mut [u8]) -> Result<(), CryptoError> {
+    let blocks = (buf.len() as u64).div_ceil(BLOCK_LEN as u64);
     if blocks > (1u64 << 32) - counter as u64 {
-        return Err(());
+        return Err(CryptoError::CounterOverflow);
     }
 
     let mut state = init_state(key, nonce, counter);
-    let mut ks = [0u8; 64];
+    let mut ks = [0u8; BLOCK_LEN];
 
-    for chunk in buf.chunks_mut(64) {
+    for chunk in buf.chunks_mut(BLOCK_LEN) {
         block_from_state(&state, &mut ks);
         for (b, k) in chunk.iter_mut().zip(ks.iter()) {
             *b ^= k;
         }
         // Wrap only ever happens after the final block (checked above).
-        state[12] = state[12].wrapping_add(1);
+        state[COUNTER_WORD] = state[COUNTER_WORD].wrapping_add(1);
     }
 
     wipe(&mut ks);
@@ -98,10 +103,7 @@ pub fn chacha20_xor(key: &[u8; 32], nonce: &[u8; 12], counter: u32, buf: &mut [u
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::hex;
-
-    pub(crate) const SUNSCREEN: &[u8; 114] = b"Ladies and Gentlemen of the class of '99: \
-If I could offer you only one tip for the future, sunscreen would be it.";
+    use crate::crypto::{hex, SUNSCREEN};
 
     #[test]
     fn test_chacha20_rfc8439_2_4_2() {

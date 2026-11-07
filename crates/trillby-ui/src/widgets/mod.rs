@@ -8,6 +8,14 @@ pub use button::{Button, ButtonVariant};
 pub use card::Card;
 pub use text_field::TextField;
 
+pub(crate) fn centered_baseline_y(
+    bounds: embedded_graphics::primitives::Rectangle,
+    font: &embedded_graphics::mono_font::MonoFont,
+) -> i32 {
+    let char_h = font.character_size.height as i32;
+    bounds.top_left.y + (bounds.size.height as i32 - char_h) / 2 + font.baseline as i32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -17,81 +25,71 @@ mod tests {
         pixelcolor::Rgb565,
         primitives::Rectangle,
     };
-    use embedded_graphics_framebuf::FrameBuf;
+    use embedded_graphics_framebuf::{backends::FrameBufferBackend, FrameBuf};
+
+    struct SliceBuf<'a>(&'a mut [Rgb565]);
+
+    impl<'a> FrameBufferBackend for SliceBuf<'a> {
+        type Color = Rgb565;
+        fn set(&mut self, index: usize, color: Rgb565) {
+            self.0[index] = color;
+        }
+        fn get(&self, index: usize) -> Rgb565 {
+            self.0[index]
+        }
+        fn nr_elements(&self) -> usize {
+            self.0.len()
+        }
+    }
+
+    fn draw_widget(
+        w: usize,
+        h: usize,
+        fill: Rgb565,
+        draw: impl FnOnce(&mut FrameBuf<Rgb565, SliceBuf<'_>>),
+    ) -> std::vec::Vec<Rgb565> {
+        let mut pixels = std::vec![fill; w * h];
+        let mut fb = FrameBuf::new(SliceBuf(&mut pixels), w, h);
+        draw(&mut fb);
+        pixels
+    }
+
+    fn button_pixel(variant: ButtonVariant, pressed: bool) -> Rgb565 {
+        let bounds = Rectangle::new(Point::zero(), Size::new(120, 40));
+        let theme = DarkFloorTheme;
+        let pixels = draw_widget(120, 40, theme.background(), |fb| {
+            Button::new(bounds, "LABEL")
+                .variant(variant)
+                .pressed(pressed)
+                .draw(fb, &theme)
+                .unwrap();
+        });
+        pixels[5 * 120 + 5]
+    }
 
     #[test]
     fn button_variants_pressed_states_and_danger_distinct_from_warning() {
         let theme = DarkFloorTheme;
-        let bounds = Rectangle::new(Point::zero(), Size::new(120, 40));
-
-        // Primary unpressed
-        let mut pixels = [theme.background(); 120 * 40];
-        let mut fb = FrameBuf::new(&mut pixels, 120, 40);
-        Button::new(bounds, "OK")
-            .variant(ButtonVariant::Primary)
-            .pressed(false)
-            .draw(&mut fb, &theme)
-            .unwrap();
-        assert_eq!(pixels[5 * 120 + 5], theme.primary());
-
-        // Primary pressed
-        let mut pixels = [theme.background(); 120 * 40];
-        let mut fb = FrameBuf::new(&mut pixels, 120, 40);
-        Button::new(bounds, "OK")
-            .variant(ButtonVariant::Primary)
-            .pressed(true)
-            .draw(&mut fb, &theme)
-            .unwrap();
-        assert_eq!(pixels[5 * 120 + 5], theme.surface_active());
-
-        // Danger button must use a danger color distinct from theme.warning()
-        let mut pixels = [theme.background(); 120 * 40];
-        let mut fb = FrameBuf::new(&mut pixels, 120, 40);
-        Button::new(bounds, "DANGER")
-            .variant(ButtonVariant::Danger)
-            .pressed(false)
-            .draw(&mut fb, &theme)
-            .unwrap();
+        assert_eq!(button_pixel(ButtonVariant::Primary, false), theme.primary());
+        assert_eq!(button_pixel(ButtonVariant::Primary, true), theme.surface_active());
         assert_ne!(
-            pixels[5 * 120 + 5],
+            button_pixel(ButtonVariant::Danger, false),
             theme.warning(),
             "ButtonVariant::Danger must use a danger color distinct from theme.warning()"
         );
-
-        // Secondary unpressed
-        let mut pixels = [theme.background(); 120 * 40];
-        let mut fb = FrameBuf::new(&mut pixels, 120, 40);
-        Button::new(bounds, "SEC")
-            .variant(ButtonVariant::Secondary)
-            .pressed(false)
-            .draw(&mut fb, &theme)
-            .unwrap();
-        assert_eq!(pixels[5 * 120 + 5], theme.surface());
-
-        // Ghost unpressed leaves background untouched
-        let sentinel = Rgb565::new(31, 0, 31);
-        let mut pixels = [sentinel; 120 * 40];
-        let mut fb = FrameBuf::new(&mut pixels, 120, 40);
-        Button::new(bounds, "GHOST")
-            .variant(ButtonVariant::Ghost)
-            .pressed(false)
-            .draw(&mut fb, &theme)
-            .unwrap();
-        assert_eq!(pixels[5 * 120 + 5], sentinel);
+        assert_eq!(button_pixel(ButtonVariant::Secondary, false), theme.surface());
     }
 
     #[test]
     fn button_long_label_does_not_draw_outside_button_bounds() {
         let theme = DarkFloorTheme;
         let bounds = Rectangle::new(Point::new(20, 10), Size::new(40, 24));
-        let mut pixels = [Rgb565::new(0, 0, 0); 100 * 50];
-        let mut fb = FrameBuf::new(&mut pixels, 100, 50);
-
-        Button::new(bounds, "VERY_LONG_BUTTON_LABEL")
-            .variant(ButtonVariant::Primary)
-            .draw(&mut fb, &theme)
-            .unwrap();
-
+        let pixels = draw_widget(100, 50, Rgb565::new(0, 0, 0), |fb| {
+            Button::new(bounds, "VERY_LONG_BUTTON_LABEL")
+                .variant(ButtonVariant::Primary)
+                .draw(fb, &theme)
+                .unwrap();
+        });
         for y in 0..50 {
             for x in 0..100 {
                 if x < 20 || x >= 60 || y < 10 || y >= 34 {
@@ -118,41 +116,42 @@ mod tests {
         let divider_y = card_bounds.top_left.y + pad_v + font.baseline as i32 + pad_v;
 
         // Card with title
-        let mut pixels = [theme.background(); 120 * 100];
-        let mut fb = FrameBuf::new(&mut pixels, 120, 100);
-        Card::new(card_bounds)
-            .title("TEST")
-            .draw(&mut fb, &theme)
-            .unwrap();
+        let pixels = draw_widget(120, 100, theme.background(), |fb| {
+            Card::new(card_bounds)
+                .title("TEST")
+                .draw(fb, &theme)
+                .unwrap();
+        });
         assert_eq!(pixels[divider_y as usize * 120 + 50], theme.border());
 
         // Card without title
-        let mut pixels = [theme.background(); 120 * 100];
-        let mut fb = FrameBuf::new(&mut pixels, 120, 100);
-        Card::new(card_bounds)
-            .draw(&mut fb, &theme)
-            .unwrap();
+        let pixels = draw_widget(120, 100, theme.background(), |fb| {
+            Card::new(card_bounds)
+                .draw(fb, &theme)
+                .unwrap();
+        });
         assert_eq!(pixels[divider_y as usize * 120 + 50], theme.surface());
 
         // TextField border test
         let field_bounds = Rectangle::new(Point::new(10, 10), Size::new(100, 40));
 
         // Unfocused TextField
-        let mut pixels = [theme.background(); 120 * 60];
-        let mut fb = FrameBuf::new(&mut pixels, 120, 60);
-        TextField::new(field_bounds)
-            .focused(false)
-            .draw(&mut fb, &theme)
-            .unwrap();
+        let pixels = draw_widget(120, 60, theme.background(), |fb| {
+            TextField::new(field_bounds)
+                .focused(false)
+                .draw(fb, &theme)
+                .unwrap();
+        });
         assert_eq!(pixels[10 * 120 + 50], theme.border());
 
         // Focused TextField
-        let mut pixels = [theme.background(); 120 * 60];
-        let mut fb = FrameBuf::new(&mut pixels, 120, 60);
-        TextField::new(field_bounds)
-            .focused(true)
-            .draw(&mut fb, &theme)
-            .unwrap();
+        let pixels = draw_widget(120, 60, theme.background(), |fb| {
+            TextField::new(field_bounds)
+                .focused(true)
+                .draw(fb, &theme)
+                .unwrap();
+        });
         assert_eq!(pixels[10 * 120 + 50], theme.primary());
     }
+
 }

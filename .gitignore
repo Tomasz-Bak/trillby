@@ -5,6 +5,7 @@
 
 # Documentation / Meta files
 /docs/
+/artifacts/
 
 # Generated kernel/initramfs artifacts
 /initramfs.cpio.gz

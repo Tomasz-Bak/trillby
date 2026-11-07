@@ -1,21 +1,19 @@
 [package]
 name = "trillby-server"
-version = "0.1.0"
-edition = "2021"
-authors = ["Trillby Team"]
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
 description = "Minimal floor server sink: accepts Trillby clients and logs events to stdout"
 
 [dependencies]
-trillby-net = { path = "../trillby-net" }
-heapless = "0.8"
-libc = "0.2"
+trillby-net = { workspace = true }
+heapless = { workspace = true }
+libc = { workspace = true }
 
 
 [dev-dependencies]
-trillby-core = { path = "../trillby-core" }
-trillby-ui = { path = "../trillby-ui" }
-embedded-graphics = "0.8"
-embedded-graphics-framebuf = "0.3"
-[[bin]]
-name = "trillby-server"
-path = "src/main.rs"
+trillby-core = { workspace = true }
+trillby-ui = { workspace = true }
+embedded-graphics = { workspace = true }
+embedded-graphics-framebuf = { workspace = true }
+tempfile = { workspace = true }
