@@ -1,107 +1,65 @@
 //! ChaCha20-Poly1305 AEAD construction (RFC 8439).
 
-use super::chacha20::{chacha20_block, chacha20_xor};
+use super::chacha20::{chacha20_block, chacha20_xor, BLOCK_LEN, KEY_LEN, NONCE_LEN};
 use super::constant_time_eq;
-use super::poly1305::Poly1305;
+use super::poly1305::{Poly1305, TAG_LEN};
 use super::wipe;
+use super::CryptoError;
 
-pub fn chacha20_poly1305_encrypt(
-    key: &[u8; 32],
-    nonce: &[u8; 12],
+fn compute_tag(
+    key: &[u8; KEY_LEN],
+    nonce: &[u8; NONCE_LEN],
     aad: &[u8],
-    plaintext_and_tag: &mut [u8], // Last 16 bytes will receive the Poly1305 tag
-) -> Result<(), ()> {
-    if plaintext_and_tag.len() < 16 {
-        return Err(());
-    }
-    let pt_len = plaintext_and_tag.len() - 16;
-
-    // 1. Generate Poly1305 one-time key with block counter 0
-    const ZERO_PAD: [u8; 16] = [0u8; 16];
-
-    let mut poly_key_block = [0u8; 64];
+    ciphertext: &[u8],
+) -> [u8; TAG_LEN] {
+    let mut poly_key_block = [0u8; BLOCK_LEN];
     chacha20_block(key, nonce, 0, &mut poly_key_block);
-    let mut poly_key = [0u8; 32];
-    poly_key.copy_from_slice(&poly_key_block[..32]);
-
-    // 2. Encrypt plaintext in place (starting at counter 1)
-    if chacha20_xor(key, nonce, 1, &mut plaintext_and_tag[..pt_len]).is_err() {
-        wipe(&mut poly_key_block);
-        wipe(&mut poly_key);
-        return Err(());
-    }
-
-    // 3. Compute Poly1305 tag over AAD || pad || Ciphertext || pad || len(AAD) || len(Ciphertext)
-    let mut poly = Poly1305::new(&poly_key);
+    let mut poly = Poly1305::new(poly_key_block[..KEY_LEN].try_into().unwrap());
+    wipe(&mut poly_key_block);
 
     poly.update(aad);
-    if aad.len() % 16 != 0 {
-        poly.update(&ZERO_PAD[..16 - (aad.len() % 16)]);
-    }
+    poly.pad16();
 
-    poly.update(&plaintext_and_tag[..pt_len]);
-    if pt_len % 16 != 0 {
-        poly.update(&ZERO_PAD[..16 - (pt_len % 16)]);
-    }
+    poly.update(ciphertext);
+    poly.pad16();
 
     poly.update(&(aad.len() as u64).to_le_bytes());
-    poly.update(&(pt_len as u64).to_le_bytes());
+    poly.update(&(ciphertext.len() as u64).to_le_bytes());
 
-    let tag = poly.finalize();
-    plaintext_and_tag[pt_len..pt_len + 16].copy_from_slice(&tag);
+    poly.finalize()
+}
 
-    wipe(&mut poly_key_block);
-    wipe(&mut poly_key);
+pub fn chacha20_poly1305_encrypt(
+    key: &[u8; KEY_LEN],
+    nonce: &[u8; NONCE_LEN],
+    aad: &[u8],
+    plaintext_and_tag: &mut [u8],
+) -> Result<(), CryptoError> {
+    if plaintext_and_tag.len() < TAG_LEN {
+        return Err(CryptoError::BufferTooShort);
+    }
+    let pt_len = plaintext_and_tag.len() - TAG_LEN;
+    chacha20_xor(key, nonce, 1, &mut plaintext_and_tag[..pt_len])?;
+    let tag = compute_tag(key, nonce, aad, &plaintext_and_tag[..pt_len]);
+    plaintext_and_tag[pt_len..pt_len + TAG_LEN].copy_from_slice(&tag);
     Ok(())
 }
 
 pub fn chacha20_poly1305_decrypt(
-    key: &[u8; 32],
-    nonce: &[u8; 12],
+    key: &[u8; KEY_LEN],
+    nonce: &[u8; NONCE_LEN],
     aad: &[u8],
     ciphertext_and_tag: &mut [u8],
-) -> Result<usize, ()> {
-    const ZERO_PAD: [u8; 16] = [0u8; 16];
-
-    if ciphertext_and_tag.len() < 16 {
-        return Err(());
+) -> Result<usize, CryptoError> {
+    if ciphertext_and_tag.len() < TAG_LEN {
+        return Err(CryptoError::BufferTooShort);
     }
-    let ct_len = ciphertext_and_tag.len() - 16;
-
-    // 1. Generate Poly1305 one-time key
-    let mut poly_key_block = [0u8; 64];
-    chacha20_block(key, nonce, 0, &mut poly_key_block);
-    let mut poly_key = [0u8; 32];
-    poly_key.copy_from_slice(&poly_key_block[..32]);
-
-    // 2. Verify MAC
-    let mut poly = Poly1305::new(&poly_key);
-
-    poly.update(aad);
-    if aad.len() % 16 != 0 {
-        poly.update(&ZERO_PAD[..16 - (aad.len() % 16)]);
+    let ct_len = ciphertext_and_tag.len() - TAG_LEN;
+    let expected_tag = compute_tag(key, nonce, aad, &ciphertext_and_tag[..ct_len]);
+    let actual_tag = &ciphertext_and_tag[ct_len..ct_len + TAG_LEN];
+    if !constant_time_eq(&expected_tag, actual_tag) {
+        return Err(CryptoError::AuthFailed);
     }
-
-    poly.update(&ciphertext_and_tag[..ct_len]);
-    if ct_len % 16 != 0 {
-        poly.update(&ZERO_PAD[..16 - (ct_len % 16)]);
-    }
-
-    poly.update(&(aad.len() as u64).to_le_bytes());
-    poly.update(&(ct_len as u64).to_le_bytes());
-
-    let expected_tag = poly.finalize();
-    let actual_tag = &ciphertext_and_tag[ct_len..ct_len + 16];
-
-    let valid = constant_time_eq(&expected_tag, actual_tag);
-    wipe(&mut poly_key_block);
-    wipe(&mut poly_key);
-
-    if !valid {
-        return Err(());
-    }
-
-    // 3. Decrypt ciphertext in place
     chacha20_xor(key, nonce, 1, &mut ciphertext_and_tag[..ct_len])?;
     Ok(ct_len)
 }
@@ -109,8 +67,17 @@ pub fn chacha20_poly1305_decrypt(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::hex;
+    use crate::crypto::{hex, SUNSCREEN};
 
+    fn round_trip(key: &[u8; 32], nonce: &[u8; 12], aad: &[u8], pt: &[u8]) {
+        let mut buf = [0u8; 128];
+        buf[..pt.len()].copy_from_slice(pt);
+        let total = pt.len() + TAG_LEN;
+        chacha20_poly1305_encrypt(key, nonce, aad, &mut buf[..total]).unwrap();
+        let pt_len = chacha20_poly1305_decrypt(key, nonce, aad, &mut buf[..total]).unwrap();
+        assert_eq!(pt_len, pt.len());
+        assert_eq!(&buf[..pt_len], pt);
+    }
     #[test]
     fn test_chacha20_poly1305_rfc8439_2_8_2() {
         let key = hex::<32>(
@@ -119,10 +86,9 @@ mod tests {
         );
         let nonce = hex::<12>("07 00 00 00 40 41 42 43 44 45 46 47");
         let aad = hex::<12>("50 51 52 53 c0 c1 c2 c3 c4 c5 c6 c7");
-        let plaintext = b"Ladies and Gentlemen of the class of '99: \
-If I could offer you only one tip for the future, sunscreen would be it.";
+        let plaintext = SUNSCREEN;
 
-        let expected_ct = hex::<114>(
+        let expected_ct = hex::<{ SUNSCREEN.len() }>(
             "d3 1a 8d 34 64 8e 60 db 7b 86 af bc 53 ef 7e c2 \
              a4 ad ed 51 29 6e 08 fe a9 e2 b5 a7 36 ee 62 d6 \
              3d be a4 5e 8c a9 67 12 82 fa fb 69 da 92 72 8b \
@@ -132,31 +98,32 @@ If I could offer you only one tip for the future, sunscreen would be it.";
              3f f4 de f0 8e 4b 7a 9d e5 76 d2 65 86 ce c6 4b \
              61 16",
         );
-        let expected_tag = hex::<16>("1a e1 0b 59 4f 09 e2 6a 7e 90 2e cb d0 60 06 91");
+        let expected_tag = hex::<TAG_LEN>("1a e1 0b 59 4f 09 e2 6a 7e 90 2e cb d0 60 06 91");
 
-        let mut buf = [0u8; 114 + 16];
-        buf[..114].copy_from_slice(plaintext);
+        let mut buf = [0u8; SUNSCREEN.len() + TAG_LEN];
+        buf[..SUNSCREEN.len()].copy_from_slice(plaintext);
 
         // Encrypt test: verify actual ciphertext and tag against RFC 8439
         chacha20_poly1305_encrypt(&key, &nonce, &aad, &mut buf).unwrap();
-        assert_eq!(&buf[..114], &expected_ct, "RFC 8439 2.8.2 ciphertext mismatch");
-        assert_eq!(&buf[114..], &expected_tag, "RFC 8439 2.8.2 tag mismatch");
+        assert_eq!(&buf[..expected_ct.len()], &expected_ct, "RFC 8439 2.8.2 ciphertext mismatch");
+        assert_eq!(&buf[expected_ct.len()..], &expected_tag, "RFC 8439 2.8.2 tag mismatch");
 
         // Decrypt test: verify decryption of the standard vector
         let pt_len = chacha20_poly1305_decrypt(&key, &nonce, &aad, &mut buf).unwrap();
-        assert_eq!(pt_len, 114);
+        assert_eq!(pt_len, SUNSCREEN.len());
         assert_eq!(&buf[..pt_len], plaintext);
     }
 
     #[test]
     fn test_chacha20_poly1305_rfc8439_a_5_decrypt() {
+        const CT_LEN: usize = 265;
         let key = hex::<32>(
             "1c 92 40 a5 eb 55 d3 8a f3 33 88 86 04 f6 b5 f0 \
              47 39 17 c1 40 2b 80 09 9d ca 5c bc 20 70 75 c0",
         );
         let nonce = hex::<12>("00 00 00 00 01 02 03 04 05 06 07 08");
         let aad = hex::<12>("f3 33 88 86 00 00 00 00 00 00 4e 91");
-        let ciphertext = hex::<265>(
+        let ciphertext = hex::<CT_LEN>(
             "64 a0 86 15 75 86 1a f4 60 f0 62 c7 9b e6 43 bd \
              5e 80 5c fd 34 5c f3 89 f1 08 67 0a c7 6c 8c b2 \
              4c 6c fc 18 75 5d 43 ee a0 9e e9 4e 38 2d 26 b0 \
@@ -175,8 +142,8 @@ If I could offer you only one tip for the future, sunscreen would be it.";
              30 5b ea ba 2e da 04 df 99 7b 71 4d 6c 6f 2c 29 \
              a6 ad 5c b4 02 2b 02 70 9b",
         );
-        let tag = hex::<16>("ee ad 9d 67 89 0c bb 22 39 23 36 fe a1 85 1f 38");
-        let expected_pt = hex::<265>(
+        let tag = hex::<TAG_LEN>("ee ad 9d 67 89 0c bb 22 39 23 36 fe a1 85 1f 38");
+        let expected_pt = hex::<CT_LEN>(
             "49 6e 74 65 72 6e 65 74 2d 44 72 61 66 74 73 20 \
              61 72 65 20 64 72 61 66 74 20 64 6f 63 75 6d 65 \
              6e 74 73 20 76 61 6c 69 64 20 66 6f 72 20 61 20 \
@@ -196,12 +163,12 @@ If I could offer you only one tip for the future, sunscreen would be it.";
              72 65 73 73 2e 2f e2 80 9d",
         );
 
-        let mut buf = [0u8; 265 + 16];
-        buf[..265].copy_from_slice(&ciphertext);
-        buf[265..].copy_from_slice(&tag);
+        let mut buf = [0u8; CT_LEN + TAG_LEN];
+        buf[..ciphertext.len()].copy_from_slice(&ciphertext);
+        buf[ciphertext.len()..].copy_from_slice(&tag);
 
         let pt_len = chacha20_poly1305_decrypt(&key, &nonce, &aad, &mut buf).unwrap();
-        assert_eq!(pt_len, 265);
+        assert_eq!(pt_len, ciphertext.len());
         assert_eq!(&buf[..pt_len], &expected_pt, "RFC 8439 A.5 decrypted plaintext mismatch");
     }
 
@@ -212,9 +179,11 @@ If I could offer you only one tip for the future, sunscreen would be it.";
         let aad = b"HDR_SEQ_1001";
         let plaintext = b"TR_WORK_ORDER_OP_8829_PART_99";
 
+        round_trip(&key, &nonce, aad, plaintext);
+
         let mut buf = [0u8; 128];
         buf[..plaintext.len()].copy_from_slice(plaintext);
-        let total_len = plaintext.len() + 16;
+        let total_len = plaintext.len() + TAG_LEN;
 
         chacha20_poly1305_encrypt(&key, &nonce, aad, &mut buf[..total_len]).unwrap();
         // Ciphertext is now encrypted and tagged
@@ -245,5 +214,33 @@ If I could offer you only one tip for the future, sunscreen would be it.";
 
         let pt_len = chacha20_poly1305_decrypt(&key, &nonce, b"", &mut buf).unwrap();
         assert_eq!(pt_len, 0);
+    }
+
+    #[test]
+    fn test_aead_short_buffers_and_16_byte_multiple_alignment() {
+        let key = [0x42u8; 32];
+        let nonce = [0x17u8; 12];
+        let aad = [0x33u8; 32];
+
+        // 1. Buffers shorter than TAG_LEN (16 bytes) must return Err(CryptoError::BufferTooShort)
+        for len in [0, 1, 15] {
+            let mut short = [0u8; 15];
+            assert_eq!(
+                chacha20_poly1305_encrypt(&key, &nonce, &aad, &mut short[..len]),
+                Err(CryptoError::BufferTooShort)
+            );
+            assert_eq!(
+                chacha20_poly1305_decrypt(&key, &nonce, &aad, &mut short[..len]),
+                Err(CryptoError::BufferTooShort)
+            );
+        }
+
+        // 2. Round-trip when aad.len() in [16, 32] and pt_len in [16, 32] (% 16 == 0)
+        let sample_pt = [0xa5u8; 32];
+        for &aad_len in &[16, 32] {
+            for &pt_len in &[16, 32] {
+                round_trip(&key, &nonce, &aad[..aad_len], &sample_pt[..pt_len]);
+            }
+        }
     }
 }

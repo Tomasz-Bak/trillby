@@ -2,12 +2,16 @@
 # Trillby Raspberry Pi Zero 2 W Kernel Build Script
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
 KERNEL_DIR="${1:-./linux}"
-CONFIG_SRC="$(pwd)/kernel/rpi_zero2w_defconfig"
+CONFIG_SRC="$PROJECT_ROOT/kernel/rpi_zero2w_defconfig"
 ARCH="arm64"
 
 # Add LLVM binaries to PATH if available
-export PATH="/usr/lib/llvm/22/bin:/usr/lib/llvm/21/bin:$PATH"
+LLVM_BIN_DIRS="${LLVM_BIN_DIRS:-/usr/lib/llvm/22/bin:/usr/lib/llvm/21/bin}"
+export PATH="$LLVM_BIN_DIRS:$PATH"
 
 # Auto-detect toolchain: GCC cross-compiler or LLVM/Clang
 if command -v aarch64-unknown-linux-gnu-gcc &>/dev/null; then
@@ -53,6 +57,6 @@ make $MAKE_ARGS -j"$(nproc)" Image modules dtbs
 
 echo "============================================================"
 echo " ==> Kernel build completed successfully!"
-echo "     Kernel Image: $KERNEL_DIR/arch/arm64/boot/Image"
-echo "     DTB:          $KERNEL_DIR/arch/arm64/boot/dts/broadcom/bcm2710-rpi-zero-2-w.dtb"
+echo "     Kernel Image: $KERNEL_DIR/arch/$ARCH/boot/Image"
+echo "     DTB:          $KERNEL_DIR/arch/$ARCH/boot/dts/broadcom/bcm2710-rpi-zero-2-w.dtb"
 echo "============================================================"

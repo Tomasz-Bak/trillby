@@ -23,14 +23,14 @@ pub enum OutboxError {
 }
 
 #[derive(Clone, Copy)]
-pub struct QueuedEvent {
-    pub msg_type: MsgType,
-    pub len: u8,
-    pub data: [u8; MAX_EVENT_LEN],
+struct QueuedEvent {
+    msg_type: MsgType,
+    len: u8,
+    data: [u8; MAX_EVENT_LEN],
 }
 
 impl QueuedEvent {
-    pub const fn empty() -> Self {
+    const fn empty() -> Self {
         Self {
             msg_type: MsgType::Data,
             len: 0,
@@ -173,5 +173,46 @@ mod tests {
             outbox.push(MsgType::Data, &[0u8; MAX_EVENT_LEN + 1]),
             Err(OutboxError::FrameTooLarge)
         );
+    }
+
+    #[test]
+    fn test_outbox_clear_and_capacity_reuse() {
+        let mut outbox: Outbox<3> = Outbox::new();
+        assert_eq!(outbox.capacity(), 3);
+        assert!(outbox.is_empty());
+        assert_eq!(outbox.len(), 0);
+
+        // Fill to capacity
+        assert!(outbox.push(MsgType::Data, b"EVENT_1").is_ok());
+        assert!(outbox.push(MsgType::Data, b"EVENT_2").is_ok());
+        assert!(outbox.push(MsgType::Data, b"EVENT_3").is_ok());
+        assert!(outbox.is_full());
+        assert_eq!(outbox.len(), 3);
+        assert_eq!(outbox.push(MsgType::Data, b"EVENT_4"), Err(OutboxError::Full));
+
+        // Clear outbox
+        outbox.clear();
+        assert!(outbox.is_empty());
+        assert!(!outbox.is_full());
+        assert_eq!(outbox.len(), 0);
+        assert_eq!(outbox.peek(), None);
+        assert!(!outbox.pop());
+
+        // Re-fill to capacity to verify reuse
+        assert!(outbox.push(MsgType::Data, b"EVENT_A").is_ok());
+        assert!(outbox.push(MsgType::Data, b"EVENT_B").is_ok());
+        assert!(outbox.push(MsgType::Data, b"EVENT_C").is_ok());
+        assert!(outbox.is_full());
+        assert_eq!(outbox.len(), 3);
+        assert_eq!(outbox.push(MsgType::Data, b"EVENT_D"), Err(OutboxError::Full));
+
+        assert_eq!(outbox.peek().unwrap().1, b"EVENT_A");
+        assert!(outbox.pop());
+        assert_eq!(outbox.peek().unwrap().1, b"EVENT_B");
+        assert!(outbox.pop());
+        assert_eq!(outbox.peek().unwrap().1, b"EVENT_C");
+        assert!(outbox.pop());
+        assert!(outbox.is_empty());
+        assert!(!outbox.pop());
     }
 }

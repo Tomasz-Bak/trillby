@@ -1,18 +1,20 @@
+#[path = "../tests/support/mod.rs"]
+mod support;
+
 use embedded_graphics::{
     geometry::{Point, Size},
     pixelcolor::{Rgb565, RgbColor},
     primitives::Rectangle,
 };
-use embedded_graphics_framebuf::FrameBuf;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use trillby_core::{
     KeyboardLayer, Point as CorePoint, UiEvent, UiState,
 };
-use trillby_ui::{eg_rect_to_core, UiRenderer};
+use trillby_ui::{UiRenderer, SCREEN_HEIGHT, SCREEN_WIDTH};
 
 /// Dump RGB565 framebuffer slice to a Netpbm PPM (P6 binary) image file with 8-bit color scaling.
-fn save_ppm_image(path: &str, pixels: &[Rgb565; 800 * 480], width: usize, height: usize) -> std::io::Result<()> {
+fn save_ppm_image(path: &str, pixels: &[Rgb565], width: usize, height: usize) -> std::io::Result<()> {
     let file = File::create(path)?;
     let mut writer = BufWriter::new(file);
 
@@ -33,41 +35,33 @@ fn save_ppm_image(path: &str, pixels: &[Rgb565; 800 * 480], width: usize, height
 }
 
 fn dump_ui_state(visible: bool, layer: KeyboardLayer, filename_base: &str) -> std::io::Result<()> {
-    let width = 800;
-    let height = 480;
+    let width = SCREEN_WIDTH as usize;
+    let height = SCREEN_HEIGHT as usize;
 
-    let screen_bounds = Rectangle::new(Point::zero(), Size::new(width as u32, height as u32));
-    let core_screen_bounds = eg_rect_to_core(screen_bounds);
-    let mut pixels = [Rgb565::new(0, 0, 0); 800 * 480];
+    let screen_bounds = Rectangle::new(Point::zero(), Size::new(SCREEN_WIDTH, SCREEN_HEIGHT));
 
     let mut state: UiState<256> = UiState::new();
-    state.keyboard_visible = visible;
-    state.keyboard_layer = layer;
     let renderer = UiRenderer::new(screen_bounds);
 
     // Populate static demonstration telemetry data
-    let card_id = heapless::String::try_from("OPERATOR_CARD_9021").unwrap();
-    state.handle_event(UiEvent::RfidScanned(card_id), core_screen_bounds, None, None);
-
-    let barcode_id = heapless::String::try_from("ITEM-UNIT-448102").unwrap();
-    state.handle_event(UiEvent::BarcodeScanned(barcode_id), core_screen_bounds, None, None);
+    support::start_job(&mut state, "OPERATOR_CARD_9021", "ITEM-UNIT-448102");
 
     state.handle_event(
         UiEvent::TouchDown {
             scaled: CorePoint::new(120, 340),
             raw: (4800, 22000),
         },
-        core_screen_bounds,
         None,
         None,
     );
 
+    state.keyboard_visible = visible;
+    state.keyboard_layer = layer;
     // Render UI frame onto target FrameBuf
-    let mut framebuffer = FrameBuf::new(&mut pixels, width, height);
-    renderer.render(&mut framebuffer, &state).expect("Failed to render UI frame");
+    let canvas = support::render_to_canvas(&renderer, &state);
 
     let ppm_path = format!("{}.ppm", filename_base);
-    save_ppm_image(&ppm_path, &pixels, width, height)?;
+    save_ppm_image(&ppm_path, &canvas.pixels, width, height)?;
     println!("Exported Layout Dump -> '{}' (visible: {}, layer: {:?}, {}x{} PPM)", ppm_path, visible, layer, width, height);
 
     Ok(())

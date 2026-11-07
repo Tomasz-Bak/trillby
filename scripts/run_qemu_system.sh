@@ -2,14 +2,20 @@
 # Trillby QEMU 800x480 Graphical Machine Launcher
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$PROJECT_ROOT"
+
 MEMORY="512M"
 WIDTH=800
 HEIGHT=480
-KERNEL="$(pwd)/linux/arch/arm64/boot/Image"
-INITRD="$(pwd)/initramfs.cpio.gz"
-
+TARGET="aarch64-unknown-linux-musl"
+PROFILE="debug"
+KERNEL_DIR="${KERNEL_DIR:-$PROJECT_ROOT/linux}"
+KERNEL="${KERNEL:-$KERNEL_DIR/arch/arm64/boot/Image}"
+INITRD="$PROJECT_ROOT/initramfs.cpio.gz"
 echo "============================================================"
-echo " Launching Trillby QEMU 800x480 Graphical Machine"
+echo " Launching Trillby QEMU ${WIDTH}x${HEIGHT} Graphical Machine"
 echo " Kernel: $KERNEL"
 echo " Initrd: $INITRD"
 echo " Resolution: ${WIDTH}x${HEIGHT} | Memory: ${MEMORY}"
@@ -22,16 +28,14 @@ if [ ! -f "$KERNEL" ]; then
 fi
 
 echo "==> Building static AArch64 Trillby binary..."
-CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-unknown-linux-musl-gcc \
-RUSTFLAGS="-C target-feature=+crt-static -C link-self-contained=no -C link-arg=-Wl,-static -C link-arg=-lc" \
 RUSTC_BOOTSTRAP=1 \
-cargo build -Z build-std --target aarch64-unknown-linux-musl --package trillby --features qemu-sim
+cargo build -Z build-std --target "$TARGET" --package trillby --features qemu-sim
 
-STAGING_DIR="$(pwd)/target/initramfs_staging"
+STAGING_DIR="$PROJECT_ROOT/target/initramfs_staging"
 echo "==> Packaging initramfs with static Trillby binary as /init..."
 rm -rf "$STAGING_DIR"
 mkdir -p "$STAGING_DIR"/{dev,proc,sys,etc}
-cp target/aarch64-unknown-linux-musl/debug/trillby "$STAGING_DIR/init"
+cp "target/$TARGET/$PROFILE/trillby" "$STAGING_DIR/init"
 chmod +x "$STAGING_DIR/init"
 
 (cd "$STAGING_DIR" && find . | cpio -o -H newc | gzip > "$INITRD")
@@ -57,7 +61,7 @@ exec qemu-system-aarch64 \
     -append "console=tty0 console=ttyAMA0 video=${WIDTH}x${HEIGHT}-32 earlycon devtmpfs.mount=1 rw" \
     -device virtio-gpu-pci,xres=$WIDTH,yres=$HEIGHT \
     -device virtio-tablet-pci \
-    -netdev user,id=net0,hostfwd=tcp::8088-:8088 \
+    -netdev user,id=net0 \
     -device virtio-net-pci,netdev=net0 \
     -display "$DISPLAY_OPT" \
     -serial stdio

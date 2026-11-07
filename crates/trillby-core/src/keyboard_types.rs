@@ -11,6 +11,8 @@ pub enum KeyboardLayer {
 }
 
 impl KeyboardLayer {
+    pub const ALL: [Self; 2] = [Self::Alpha, Self::Symbols];
+
     pub const fn toggled(self) -> Self {
         match self {
             Self::Alpha => Self::Symbols,

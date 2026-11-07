@@ -8,6 +8,21 @@ members = [
 ]
 resolver = "2"
 
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Trillby Team"]
+
+[workspace.dependencies]
+heapless = "0.8"
+libc = "0.2"
+embedded-graphics = "0.8"
+embedded-graphics-framebuf = "0.3"
+trillby-core = { path = "crates/trillby-core" }
+trillby-ui = { path = "crates/trillby-ui" }
+trillby-net = { path = "crates/trillby-net" }
+tempfile = "3"
+
 [profile.dev]
 panic = "abort"
 
